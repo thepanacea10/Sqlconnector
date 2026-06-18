@@ -21,6 +21,27 @@ function parseDays(value) {
   return Math.min(Math.max(Math.trunc(days), 1), 365);
 }
 
+function parseSelectedDate(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    throw badRequest('Invalid date. Use YYYY-MM-DD.');
+  }
+
+  const [year, month, day] = text.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    throw badRequest('Invalid date. Use YYYY-MM-DD.');
+  }
+
+  return date;
+}
+
 function searchText(value) {
   return String(value ?? '').trim();
 }
@@ -32,6 +53,28 @@ function bindSearch(request, search) {
 
 function bindId(request, id) {
   request.input('id', sql.Int, parseId(id));
+}
+
+function bindSelectedDate(request, selectedDate) {
+  if (selectedDate) {
+    request.input('selectedDate', sql.NVarChar, formatDateInputValue(selectedDate));
+  }
+}
+
+function formatDateInputValue(date) {
+  if (!date) return null;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function selectedDateFilter(columnName, selectedDate) {
+  if (selectedDate) {
+    return `${columnName} >= CONVERT(DATETIME, @selectedDate, 120) AND ${columnName} < DATEADD(DAY, 1, CONVERT(DATETIME, @selectedDate, 120))`;
+  }
+
+  return `${columnName} >= CAST(GETDATE() AS DATE) AND ${columnName} < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))`;
 }
 
 const customerBalanceApply = `
@@ -439,33 +482,23 @@ export async function getExpiry({ days }) {
   };
 }
 
-export async function getSalesToday() {
-  const summaryQuery = `
+export async function getSalesToday({ date } = {}) {
+  const selectedDate = parseSelectedDate(date);
+  const cashboxDateFilter = selectedDateFilter('ov.Date_paid', selectedDate);
+  const invoiceDateFilter = selectedDateFilter('mr.Movementrestrictions_Date', selectedDate);
+
+  const sellerCashboxesQuery = `
     SELECT
-      ISNULL(SUM(
-        CASE
-          WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0)
-          WHEN mr.Account_No IN (3, 4) THEN -ISNULL(invoiceTotals.total, 0)
-          ELSE 0
-        END
-      ), 0) AS totalSales,
-      SUM(CASE WHEN mr.Account_No IN (1, 2) THEN 1 ELSE 0 END) AS invoiceCount,
-      CASE
-        WHEN SUM(CASE WHEN mr.Account_No IN (1, 2) THEN 1 ELSE 0 END) = 0 THEN 0
-        ELSE
-          SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0) ELSE 0 END)
-          / SUM(CASE WHEN mr.Account_No IN (1, 2) THEN 1 ELSE 0 END)
-      END AS averageInvoice
-    FROM dbo.The_Movementrestrictions mr
-    OUTER APPLY (
-      SELECT SUM(ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0)) AS total
-      FROM dbo.The_Details d
-      WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
-    ) invoiceTotals
-    WHERE mr.Movementrestrictions_Date >= CAST(GETDATE() AS DATE)
-      AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
-      AND ISNULL(mr.Case_Invoice, 0) = 0
-      AND mr.Account_No IN (1, 2, 3, 4)
+      ov.User_No AS sellerId,
+      p.Person_Name AS sellerName,
+      SUM(ISNULL(ov.Value_paid, 0)) AS total,
+      COUNT(ov.Outstandingvalues_No) AS entryCount
+    FROM dbo.The_Outstandingvalues ov
+    LEFT JOIN dbo.The_Persons p ON p.Person_No = ov.User_No
+    WHERE ${cashboxDateFilter}
+      AND ov.Account_No IN (1, 3)
+    GROUP BY ov.User_No, p.Person_Name
+    ORDER BY total DESC, sellerName ASC
   `;
 
   const productsQuery = `
@@ -494,21 +527,28 @@ export async function getSalesToday() {
       WHERE t.Item_No = i.Item_No
       ORDER BY t.Trade_No ASC
     ) tradeName
-    WHERE mr.Movementrestrictions_Date >= CAST(GETDATE() AS DATE)
-      AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+    WHERE ${invoiceDateFilter}
       AND ISNULL(mr.Case_Invoice, 0) = 0
       AND mr.Account_No IN (1, 2, 3, 4)
     GROUP BY COALESCE(tradeName.Trade_Name, i.Scientific_Name)
     ORDER BY quantity DESC
   `;
 
-  const [summary, topProducts] = await Promise.all([
-    executeReadonlyQuery(summaryQuery),
-    executeReadonlyQuery(productsQuery)
+  const bindDate = (request) => bindSelectedDate(request, selectedDate);
+  const [sellerCashboxes, topProducts] = await Promise.all([
+    executeReadonlyQuery(sellerCashboxesQuery, bindDate),
+    executeReadonlyQuery(productsQuery, bindDate)
   ]);
+  const cashboxRows = sellerCashboxes.recordset || [];
 
   return {
-    summary: summary.recordset?.[0] || { totalSales: 0, invoiceCount: 0, averageInvoice: 0 },
+    selectedDate: formatDateInputValue(selectedDate),
+    summary: {
+      totalSales: cashboxRows.reduce((total, row) => total + Number(row.total || 0), 0),
+      sellerCount: cashboxRows.length,
+      entryCount: cashboxRows.reduce((total, row) => total + Number(row.entryCount || 0), 0)
+    },
+    sellerCashboxes: cashboxRows,
     topSoldProducts: topProducts.recordset || []
   };
 }

@@ -35,5 +35,5 @@ export const api = {
   items: (search) => request(`/api/items?search=${encodeURIComponent(search || '')}`),
   shortages: () => request('/api/shortages'),
   expiry: (days) => request(`/api/expiry?days=${encodeURIComponent(days)}`),
-  salesToday: () => request('/api/sales-today')
+  salesToday: (date) => request(`/api/sales-today?date=${encodeURIComponent(date || '')}`)
 };

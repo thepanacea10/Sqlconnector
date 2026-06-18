@@ -174,8 +174,8 @@ app.get(
 
 app.get(
   '/api/sales-today',
-  asyncRoute(async (_req, res) => {
-    const result = await almohasebProfile.getSalesToday();
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getSalesToday({ date: req.query.date });
     res.json({ success: true, profile: 'almohaseb', ...result });
   })
 );

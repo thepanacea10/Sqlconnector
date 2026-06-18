@@ -45,6 +45,12 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? String(value) : dateFormatter.format(date);
 }
 
+function todayInputValue() {
+  const now = new Date();
+  const localDate = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
+  return localDate.toISOString().slice(0, 10);
+}
+
 function App() {
   const [status, setStatus] = useState(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
@@ -639,26 +645,59 @@ function ExpiryModule({ title, icon, onBack }) {
 
 function SalesTodayModule({ title, icon, onBack }) {
   const [data, setData] = useState(null);
+  const [selectedDate, setSelectedDate] = useState(todayInputValue);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  const loadSalesToday = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const salesData = await api.salesToday(selectedDate);
+      setData(salesData);
+    } catch (requestError) {
+      setError(requestError.message);
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    api.salesToday()
-      .then(setData)
-      .catch((requestError) => setError(requestError.message))
-      .finally(() => setLoading(false));
-  }, []);
+    loadSalesToday();
+  }, [selectedDate]);
 
   const summary = data?.summary || {};
 
   return (
-    <ModuleShell title={title} icon={icon} onBack={onBack}>
+    <ModuleShell
+      title={title}
+      icon={icon}
+      onBack={onBack}
+      actions={
+        <TextInput
+          label="التاريخ"
+          type="date"
+          value={selectedDate}
+          onChange={setSelectedDate}
+        />
+      }
+    >
       <AsyncBlock loading={loading} error={error} empty={false}>
         <div className="summary-grid">
-          <SummaryCard label="Total sales" value={formatNumber(summary.totalSales)} />
-          <SummaryCard label="Invoice count" value={formatNumber(summary.invoiceCount)} />
-          <SummaryCard label="Average invoice" value={formatNumber(summary.averageInvoice)} />
+          <SummaryCard label="إجمالي الصناديق" value={formatNumber(summary.totalSales)} />
+          <SummaryCard label="عدد البائعين" value={formatNumber(summary.sellerCount)} />
+          <SummaryCard label="الحركات النقدية" value={formatNumber(summary.entryCount)} />
         </div>
+        <h3 className="subheading">صناديق البائعين</h3>
+        <DataTable
+          columns={[
+            { key: 'sellerName', label: 'اسم البائع' },
+            { key: 'total', label: 'الإجمالي', format: formatNumber },
+            { key: 'entryCount', label: 'عدد الحركات', format: formatNumber }
+          ]}
+          rows={data?.sellerCashboxes || []}
+        />
         <h3 className="subheading">Top sold products</h3>
         <DataTable
           columns={[
