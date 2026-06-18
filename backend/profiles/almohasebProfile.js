@@ -37,7 +37,13 @@ function bindId(request, id) {
 const customerBalanceApply = `
   OUTER APPLY (
     SELECT
-      SUM(ISNULL(invoiceTotals.total, 0)) AS total,
+      SUM(
+        CASE
+          WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0)
+          WHEN mr.Account_No IN (3, 4) THEN -ISNULL(invoiceTotals.total, 0)
+          ELSE 0
+        END
+      ) AS total,
       MAX(mr.Movementrestrictions_Date) AS lastDate
     FROM dbo.The_Movementrestrictions mr
     OUTER APPLY (
@@ -46,6 +52,7 @@ const customerBalanceApply = `
       WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
     ) invoiceTotals
     WHERE mr.Person_No = p.Person_No
+      AND mr.Account_No IN (1, 2, 3, 4)
   ) invoices
   OUTER APPLY (
     SELECT
@@ -68,7 +75,11 @@ const customerBalanceApply = `
     FROM (
       SELECT
         mr.Movementrestrictions_Date AS [date],
-        ISNULL(invoiceTotals.total, 0) AS amount
+        CASE
+          WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0)
+          WHEN mr.Account_No IN (3, 4) THEN -ISNULL(invoiceTotals.total, 0)
+          ELSE 0
+        END AS amount
       FROM dbo.The_Movementrestrictions mr
       OUTER APPLY (
         SELECT SUM(ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0)) AS total
@@ -76,6 +87,7 @@ const customerBalanceApply = `
         WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
       ) invoiceTotals
       WHERE mr.Person_No = p.Person_No
+        AND mr.Account_No IN (1, 2, 3, 4)
       UNION ALL
       SELECT ov.Date_paid AS [date], -ISNULL(ov.Value_paid, 0) AS amount
       FROM dbo.The_Outstandingvalues ov
@@ -103,7 +115,29 @@ export async function getCustomers({ search }) {
       lastMovement.amount AS lastTransactionAmount
     FROM dbo.The_Persons p
     ${customerBalanceApply}
-    WHERE p.Person_Kind = 1
+    WHERE p.Person_Kind = 2
+      AND (
+        @search = N''
+        OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
+        OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
+      )
+    ORDER BY p.Person_Name ASC
+  `;
+
+  const result = await executeReadonlyQuery(query, (request) => bindSearch(request, term));
+  return result.recordset || [];
+}
+
+export async function getSuppliers({ search }) {
+  const term = searchText(search);
+  const query = `
+    SELECT TOP (80)
+      p.Person_No AS id,
+      p.Person_Name AS name,
+      p.Person_tel AS phone,
+      p.Person_Add AS address
+    FROM dbo.The_Persons p
+    WHERE p.Person_Kind = 3
       AND (
         @search = N''
         OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
@@ -125,6 +159,7 @@ export async function getCustomer(id) {
       p.Person_Add AS address
     FROM dbo.The_Persons p
     WHERE p.Person_No = @id
+      AND p.Person_Kind = 2
   `;
 
   const result = await executeReadonlyQuery(query, (request) => bindId(request, id));
@@ -135,10 +170,19 @@ export async function getCustomerInvoices(id) {
   const query = `
     SELECT TOP (150)
       mr.Movementrestrictions_No AS invoiceNumber,
+      mr.Account_No AS accountNo,
       mr.Movementrestrictions_Date AS [date],
-      ISNULL(invoiceTotals.total, 0) AS total,
+      CASE
+        WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0)
+        WHEN mr.Account_No IN (3, 4) THEN -ISNULL(invoiceTotals.total, 0)
+        ELSE 0
+      END AS total,
       ISNULL(payments.paid, 0) AS paid,
-      ISNULL(invoiceTotals.total, 0) - ISNULL(payments.paid, 0) AS remaining
+      CASE
+        WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0)
+        WHEN mr.Account_No IN (3, 4) THEN -ISNULL(invoiceTotals.total, 0)
+        ELSE 0
+      END - ISNULL(payments.paid, 0) AS remaining
     FROM dbo.The_Movementrestrictions mr
     OUTER APPLY (
       SELECT SUM(ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0)) AS total
@@ -151,6 +195,7 @@ export async function getCustomerInvoices(id) {
       WHERE ov.Movementrestrictions_No = mr.Movementrestrictions_No
     ) payments
     WHERE mr.Person_No = @id
+      AND mr.Account_No IN (1, 2, 3, 4)
     ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC
   `;
 
@@ -195,8 +240,8 @@ export async function getCustomerStatement(id) {
     SELECT
       mr.Movementrestrictions_Date AS [date],
       N'فاتورة رقم ' + CONVERT(NVARCHAR(30), mr.Movementrestrictions_No) AS description,
-      ISNULL(invoiceTotals.total, 0) AS debit,
-      CAST(0 AS money) AS credit,
+      CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0) ELSE 0 END AS debit,
+      CASE WHEN mr.Account_No IN (3, 4) THEN ISNULL(invoiceTotals.total, 0) ELSE 0 END AS credit,
       CAST(1 AS int) AS sortOrder,
       mr.Movementrestrictions_No AS refNo
     FROM dbo.The_Movementrestrictions mr
@@ -206,6 +251,7 @@ export async function getCustomerStatement(id) {
       WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
     ) invoiceTotals
     WHERE mr.Person_No = @id
+      AND mr.Account_No IN (1, 2, 3, 4)
     UNION ALL
     SELECT
       ov.Date_paid AS [date],
@@ -265,45 +311,49 @@ export async function getCustomerStatement(id) {
   return result.recordset || [];
 }
 
-const itemLookups = `
-  OUTER APPLY (
-    SELECT TOP (1) t.Trade_Name
-    FROM dbo.The_Trade t
-    WHERE t.Item_No = i.Item_No
-    ORDER BY t.Trade_No ASC
-  ) tradeName
-  OUTER APPLY (
-    SELECT TOP (1) b.Barcode
-    FROM dbo.The_Barcode b
-    WHERE b.Item_No = i.Item_No
-    ORDER BY b.Bar_No ASC
-  ) barcode
-  OUTER APPLY (
-    SELECT TOP (1) u.Unit_Type
-    FROM dbo.The_Units u
-    WHERE u.Item_No = i.Item_No
-    ORDER BY CASE WHEN u.Default_Unit = 1 THEN 0 ELSE 1 END, u.Unit_No ASC
-  ) unitInfo
-  OUTER APPLY (
+const itemJoins = `
+  LEFT JOIN (
+    SELECT Item_No, MIN(Trade_Name) AS Trade_Name
+    FROM dbo.The_Trade
+    GROUP BY Item_No
+  ) tradeName ON tradeName.Item_No = i.Item_No
+  LEFT JOIN (
+    SELECT Item_No, MIN(Barcode) AS Barcode
+    FROM dbo.The_Barcode
+    GROUP BY Item_No
+  ) barcode ON barcode.Item_No = i.Item_No
+  LEFT JOIN (
     SELECT
-      SUM(ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0)) AS availableQuantity,
-      MAX(idt.Item_Cost) AS cost
+      Item_No,
+      COALESCE(
+        MAX(CASE WHEN Default_Unit = 1 THEN Unit_Type ELSE NULL END),
+        MIN(Unit_Type)
+      ) AS Unit_Type
+    FROM dbo.The_Units
+    GROUP BY Item_No
+  ) unitInfo ON unitInfo.Item_No = i.Item_No
+  LEFT JOIN (
+    SELECT
+      Item_No,
+      SUM(ISNULL(Item_Quantity, 0) - ISNULL(Item_Reserved, 0)) AS availableQuantity,
+      MAX(Item_Cost) AS cost
+    FROM dbo.The_ItemDetails
+    GROUP BY Item_No
+  ) stock ON stock.Item_No = i.Item_No
+  LEFT JOIN (
+    SELECT
+      idt.Item_No,
+      MAX(c.Charge_Value) AS Charge_Value
     FROM dbo.The_ItemDetails idt
-    WHERE idt.Item_No = i.Item_No
-  ) stock
-  OUTER APPLY (
-    SELECT TOP (1) c.Charge_Value
-    FROM dbo.the_Charge c
-    INNER JOIN dbo.The_ItemDetails idt ON idt.ItemDetails_No = c.ItemDetails_No
-    WHERE idt.Item_No = i.Item_No
-    ORDER BY CASE WHEN c.Default_Charge = 1 THEN 0 ELSE 1 END, c.Charge_No ASC
-  ) price
+    LEFT JOIN dbo.the_Charge c ON c.ItemDetails_No = idt.ItemDetails_No
+    GROUP BY idt.Item_No
+  ) price ON price.Item_No = i.Item_No
 `;
 
 export async function getInventory({ search }) {
   const term = searchText(search);
   const query = `
-    SELECT TOP (120)
+    SELECT
       i.Item_No AS id,
       CONVERT(NVARCHAR(50), i.Item_No) AS code,
       COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
@@ -313,7 +363,7 @@ export async function getInventory({ search }) {
       stock.cost AS cost,
       price.Charge_Value AS sellingPrice
     FROM dbo.The_Items i
-    ${itemLookups}
+    ${itemJoins}
     WHERE (
       @search = N''
       OR CONVERT(NVARCHAR(4000), i.Scientific_Name) LIKE @searchLike
@@ -336,17 +386,18 @@ export async function getShortages() {
       ISNULL(i.Out_quantitative, 0) AS minimumQuantity,
       ISNULL(i.Out_quantitative, 0) - ISNULL(stock.availableQuantity, 0) AS missingQuantity
     FROM dbo.The_Items i
-    OUTER APPLY (
-      SELECT TOP (1) t.Trade_Name
-      FROM dbo.The_Trade t
-      WHERE t.Item_No = i.Item_No
-      ORDER BY t.Trade_No ASC
-    ) tradeName
-    OUTER APPLY (
-      SELECT SUM(ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0)) AS availableQuantity
-      FROM dbo.The_ItemDetails idt
-      WHERE idt.Item_No = i.Item_No
-    ) stock
+    LEFT JOIN (
+      SELECT Item_No, MIN(Trade_Name) AS Trade_Name
+      FROM dbo.The_Trade
+      GROUP BY Item_No
+    ) tradeName ON tradeName.Item_No = i.Item_No
+    LEFT JOIN (
+      SELECT
+        Item_No,
+        SUM(ISNULL(Item_Quantity, 0) - ISNULL(Item_Reserved, 0)) AS availableQuantity
+      FROM dbo.The_ItemDetails
+      GROUP BY Item_No
+    ) stock ON stock.Item_No = i.Item_No
     WHERE ISNULL(i.Out_quantitative, 0) > 0
       AND ISNULL(stock.availableQuantity, 0) < ISNULL(i.Out_quantitative, 0)
     ORDER BY missingQuantity DESC, COALESCE(tradeName.Trade_Name, i.Scientific_Name) ASC
@@ -391,9 +442,20 @@ export async function getExpiry({ days }) {
 export async function getSalesToday() {
   const summaryQuery = `
     SELECT
-      ISNULL(SUM(ISNULL(invoiceTotals.total, 0)), 0) AS totalSales,
-      COUNT(mr.Movementrestrictions_No) AS invoiceCount,
-      ISNULL(AVG(CAST(ISNULL(invoiceTotals.total, 0) AS DECIMAL(18, 2))), 0) AS averageInvoice
+      ISNULL(SUM(
+        CASE
+          WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0)
+          WHEN mr.Account_No IN (3, 4) THEN -ISNULL(invoiceTotals.total, 0)
+          ELSE 0
+        END
+      ), 0) AS totalSales,
+      SUM(CASE WHEN mr.Account_No IN (1, 2) THEN 1 ELSE 0 END) AS invoiceCount,
+      CASE
+        WHEN SUM(CASE WHEN mr.Account_No IN (1, 2) THEN 1 ELSE 0 END) = 0 THEN 0
+        ELSE
+          SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.total, 0) ELSE 0 END)
+          / SUM(CASE WHEN mr.Account_No IN (1, 2) THEN 1 ELSE 0 END)
+      END AS averageInvoice
     FROM dbo.The_Movementrestrictions mr
     OUTER APPLY (
       SELECT SUM(ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0)) AS total
@@ -403,13 +465,26 @@ export async function getSalesToday() {
     WHERE mr.Movementrestrictions_Date >= CAST(GETDATE() AS DATE)
       AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
       AND ISNULL(mr.Case_Invoice, 0) = 0
+      AND mr.Account_No IN (1, 2, 3, 4)
   `;
 
   const productsQuery = `
     SELECT TOP (8)
       COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
-      SUM(ISNULL(d.Item_Quntity, 0)) AS quantity,
-      SUM(ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0)) AS total
+      SUM(
+        CASE
+          WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Item_Quntity, 0)
+          WHEN mr.Account_No IN (3, 4) THEN -ISNULL(d.Item_Quntity, 0)
+          ELSE 0
+        END
+      ) AS quantity,
+      SUM(
+        CASE
+          WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0)
+          WHEN mr.Account_No IN (3, 4) THEN -(ISNULL(d.Charge_Value, 0) * ISNULL(d.Item_Quntity, 0))
+          ELSE 0
+        END
+      ) AS total
     FROM dbo.The_Details d
     INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
     INNER JOIN dbo.The_Items i ON i.Item_No = d.Item_No
@@ -422,6 +497,7 @@ export async function getSalesToday() {
     WHERE mr.Movementrestrictions_Date >= CAST(GETDATE() AS DATE)
       AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
       AND ISNULL(mr.Case_Invoice, 0) = 0
+      AND mr.Account_No IN (1, 2, 3, 4)
     GROUP BY COALESCE(tradeName.Trade_Name, i.Scientific_Name)
     ORDER BY quantity DESC
   `;

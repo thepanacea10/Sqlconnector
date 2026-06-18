@@ -109,6 +109,14 @@ app.get(
 );
 
 app.get(
+  '/api/suppliers',
+  asyncRoute(async (req, res) => {
+    const suppliers = await almohasebProfile.getSuppliers({ search: req.query.search });
+    res.json({ success: true, profile: 'almohaseb', suppliers });
+  })
+);
+
+app.get(
   '/api/customer/:id',
   asyncRoute(async (req, res) => {
     const customer = await almohasebProfile.getCustomer(req.params.id);
