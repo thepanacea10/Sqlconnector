@@ -162,3 +162,43 @@ npm start
 ```
 
 بعد البناء، يخدم Express ملفات الواجهة من مجلد `dist`.
+
+## Official Runtime Ports
+
+Use one official backend/API server:
+
+- Backend/API: `http://0.0.0.0:3001`
+- Frontend/Vite: `http://0.0.0.0:5173`
+- Vite proxies `/api` to `http://127.0.0.1:3001` by default.
+- Do not run the frontend with `API_PORT=3002` except for temporary diagnostics.
+
+Development startup:
+
+```bash
+npm run backend
+npm run frontend
+```
+
+Alternative combined startup:
+
+```bash
+npm run dev
+```
+
+If port `3001` is occupied by an old Node process, stop that process first, then start the backend again. Check runtime status with:
+
+```http
+GET /api/status
+```
+
+The status response includes:
+
+```json
+{
+  "backend": {
+    "host": "0.0.0.0",
+    "port": 3001,
+    "version": "1.0.0"
+  }
+}
+```

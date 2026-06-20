@@ -1,0 +1,25 @@
+{
+  "profile": "almohaseb",
+  "notes": [
+    {
+      "topic": "Customer logic",
+      "text": "Customers are rows in dbo.The_Persons where Person_Kind = 2. Customer balance is credit sales invoices where Account_No = 2 minus payments from dbo.The_Outstandingvalues by Person_No. Invoice totals use the same Almohaseb unit-normalized detail formula as sales totals."
+    },
+    {
+      "topic": "Supplier logic",
+      "text": "Suppliers are rows in dbo.The_Persons where Person_Kind = 3."
+    },
+    {
+      "topic": "Sales logic",
+      "text": "Sales invoices are in dbo.The_Movementrestrictions and details are in dbo.The_Details joined by Movementrestrictions_No. The verified Almohaseb total normalizes Charge_Value by the item's default Unit_OldQuantity and Item_Quntity. Account_No 1 and 2 are positive sales; Account_No 3 and 4 are returns and must be deducted."
+    },
+    {
+      "topic": "Cashbox logic",
+      "text": "dbo.The_Outstandingvalues is for cashboxes, payments, and collections. It must not be used for sales totals."
+    },
+    {
+      "topic": "Inventory logic",
+      "text": "Inventory starts from dbo.The_Items and uses LEFT JOINs to preserve items that have no barcode, stock row, or price row."
+    }
+  ]
+}

@@ -11,13 +11,31 @@ import {
 } from './configStore.js';
 import { projectRoot } from './paths.js';
 import * as almohasebProfile from './profiles/almohasebProfile.js';
+import {
+  createAssistantResponse,
+  getDatabaseContext,
+  inspectTable,
+  saveKnowledgeNote
+} from './aiAssistant.js';
 
 const app = express();
 const host = process.env.API_HOST || '0.0.0.0';
 const port = Number(process.env.API_PORT || 3001);
+const packageInfo = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+const appVersion = packageInfo.version || '0.0.0';
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+
+function backendRuntimeStatus() {
+  return {
+    backend: {
+      host,
+      port,
+      version: appVersion
+    }
+  };
+}
 
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -66,6 +84,7 @@ app.get(
       res.json({
         success: true,
         profile: 'almohaseb',
+        ...backendRuntimeStatus(),
         ...publicConnectionStatus(null, false, 'Connection is not configured')
       });
       return;
@@ -76,12 +95,14 @@ app.get(
       res.json({
         success: true,
         profile: 'almohaseb',
+        ...backendRuntimeStatus(),
         ...publicConnectionStatus(settings, true, 'Connected')
       });
     } catch (error) {
       res.json({
         success: false,
         profile: 'almohaseb',
+        ...backendRuntimeStatus(),
         ...publicConnectionStatus(settings, false, messageFromError(error))
       });
     }
@@ -101,6 +122,45 @@ app.post(
 );
 
 app.get(
+  '/api/ai/context',
+  asyncRoute(async (_req, res) => {
+    const context = await getDatabaseContext();
+    res.json({ success: true, ...context });
+  })
+);
+
+app.post(
+  '/api/ai/chat',
+  asyncRoute(async (req, res) => {
+    const response = await createAssistantResponse({
+      message: req.body?.message,
+      expectedValue: req.body?.expectedValue,
+      actualValue: req.body?.actualValue
+    });
+    res.json({ success: true, message: response });
+  })
+);
+
+app.get(
+  '/api/ai/explorer/:table',
+  asyncRoute(async (req, res) => {
+    const result = await inspectTable(req.params.table);
+    res.json({ success: true, ...result });
+  })
+);
+
+app.post(
+  '/api/ai/knowledge',
+  asyncRoute(async (req, res) => {
+    const knowledge = await saveKnowledgeNote({
+      topic: req.body?.topic,
+      text: req.body?.text
+    });
+    res.json({ success: true, knowledge });
+  })
+);
+
+app.get(
   '/api/customers',
   asyncRoute(async (req, res) => {
     const customers = await almohasebProfile.getCustomers({ search: req.query.search });
@@ -113,6 +173,30 @@ app.get(
   asyncRoute(async (req, res) => {
     const suppliers = await almohasebProfile.getSuppliers({ search: req.query.search });
     res.json({ success: true, profile: 'almohaseb', suppliers });
+  })
+);
+
+app.get(
+  '/api/supplier/:id/ledger',
+  asyncRoute(async (req, res) => {
+    const rows = await almohasebProfile.getSupplierStatement(req.params.id);
+    res.json({ success: true, profile: 'almohaseb', rows });
+  })
+);
+
+app.get(
+  '/api/supplier/:id/invoices',
+  asyncRoute(async (req, res) => {
+    const rows = await almohasebProfile.getSupplierInvoices(req.params.id);
+    res.json({ success: true, profile: 'almohaseb', rows });
+  })
+);
+
+app.get(
+  '/api/supplier/:id/payments',
+  asyncRoute(async (req, res) => {
+    const rows = await almohasebProfile.getSupplierPayments(req.params.id);
+    res.json({ success: true, profile: 'almohaseb', rows });
   })
 );
 
@@ -176,6 +260,48 @@ app.get(
   '/api/sales-today',
   asyncRoute(async (req, res) => {
     const result = await almohasebProfile.getSalesToday({ date: req.query.date });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/trading-profit',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getTradingProfit({
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo
+    });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/revenue-details',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getRevenueDetails({
+      date: req.query.date,
+      sellerId: req.query.sellerId,
+      period: req.query.period,
+      paymentMethod: req.query.paymentMethod,
+      movementType: req.query.movementType,
+      expectedTotal: req.query.expectedTotal
+    });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/revenue-diagnostics',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getRevenueDiagnostics({ date: req.query.date });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/revenue-movement/:id',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getRevenueMovementDetails(req.params.id);
     res.json({ success: true, profile: 'almohaseb', ...result });
   })
 );
