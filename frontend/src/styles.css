@@ -372,17 +372,32 @@ h3 {
 
 .module-shell {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .module-header {
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
 .module-title {
-  gap: 9px;
+  gap: 8px;
+}
+
+.module-title h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.module-actions .button {
+  min-height: 36px;
+  padding: 7px 10px;
+  border-radius: 8px;
+}
+
+.module-back-button {
+  min-width: 40px;
 }
 
 .connection-badge {
@@ -646,33 +661,68 @@ h3 {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .summary-card {
   display: grid;
-  gap: 8px;
-  min-height: 104px;
-  padding: 16px;
+  align-content: start;
+  gap: 4px;
+  min-height: 76px;
+  padding: 9px 10px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 8px;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+}
+
+.summary-card svg {
+  color: var(--primary);
 }
 
 .summary-card span {
   color: var(--muted);
-  font-weight: 700;
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1.25;
 }
 
 .summary-card strong {
-  font-size: 1.7rem;
+  color: var(--ink);
+  font-size: 1.16rem;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.summary-card.is-highlight {
+  border-color: #abefc6;
+  background: #f6fef9;
+}
+
+.summary-card.is-highlight strong,
+.summary-card.is-highlight svg {
+  color: #067647;
 }
 
 .revenue-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.compact-icon-actions {
+  gap: 6px;
+}
+
+.icon-action {
+  min-width: 40px;
+  min-height: 36px;
+  padding: 7px 9px;
+}
+
+.icon-action span {
+  font-size: 0.72rem;
 }
 
 .audit-filters {
@@ -723,22 +773,70 @@ h3 {
   border-radius: 8px;
 }
 
+.compact-report-toolbar {
+  grid-template-columns: 34px minmax(0, 1fr) minmax(0, 1fr) 34px;
+  gap: 7px;
+  padding: 8px;
+}
+
+.compact-report-toolbar .filter-wide {
+  grid-column: 1 / -1;
+}
+
+.compact-report-toolbar .date-from-field {
+  grid-column: 2;
+}
+
+.compact-report-toolbar .date-to-field {
+  grid-column: 3;
+}
+
+.day-nav-button {
+  align-self: end;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.prev-day-button {
+  grid-column: 1;
+}
+
+.next-day-button {
+  grid-column: 4;
+}
+
+.compact-report-toolbar .button {
+  grid-column: 1 / -1;
+  justify-self: start;
+  width: auto;
+  min-height: 36px;
+  padding: 7px 12px;
+}
+
 .report-toolbar label {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   color: var(--muted);
+  font-size: 0.76rem;
   font-weight: 800;
 }
 
 .report-toolbar input,
 .report-toolbar select {
   width: 100%;
-  min-height: 42px;
+  min-height: 34px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #ffffff;
   color: var(--ink);
-  padding: 9px 11px;
+  padding: 6px 8px;
   outline: none;
 }
 
@@ -817,7 +915,11 @@ h3 {
 
 .drill-section {
   display: grid;
-  gap: 12px;
+  gap: 8px;
+}
+
+.drill-section .eyebrow {
+  display: none;
 }
 
 .section-title-row,
@@ -831,12 +933,13 @@ h3 {
 
 .section-title-row h3 {
   margin: 0;
+  font-size: 1rem;
 }
 
 .count-badge {
   display: inline-flex;
   min-width: 38px;
-  min-height: 32px;
+  min-height: 28px;
   align-items: center;
   justify-content: center;
   border-radius: 999px;
@@ -848,21 +951,21 @@ h3 {
 .drill-card-list {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 10px;
+  gap: 8px;
 }
 
 .drill-card {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  min-height: 78px;
+  min-height: 60px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #ffffff;
   color: var(--ink);
-  padding: 14px;
+  padding: 9px 11px;
   text-align: right;
   cursor: pointer;
 }
@@ -879,11 +982,12 @@ h3 {
 
 .drill-card div {
   display: grid;
-  gap: 5px;
+  gap: 3px;
 }
 
 .drill-card span {
   color: var(--muted);
+  font-size: 0.78rem;
   font-weight: 800;
 }
 
@@ -896,7 +1000,7 @@ h3 {
 }
 
 .drill-card-total strong {
-  font-size: 1.3rem;
+  font-size: 1.15rem;
   color: var(--primary-dark);
 }
 
@@ -1082,6 +1186,163 @@ h3 {
 
 .linked-payment-card > div:last-child {
   text-align: left;
+}
+
+.movement-slim-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+.movement-slim-main {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.movement-slim-main > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.movement-slim-main strong,
+.movement-slim-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.movement-slim-main strong {
+  color: var(--text);
+  font-size: 0.94rem;
+}
+
+.movement-slim-main span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.movement-slim-amount {
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+  min-width: 86px;
+}
+
+.movement-slim-amount strong {
+  color: var(--primary-dark);
+  font-size: 1.22rem;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.movement-slim-amount strong.is-negative {
+  color: #b42318;
+}
+
+.movement-slim-amount span {
+  max-width: 96px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #eef4ff;
+  color: #175cd3;
+  font-size: 0.72rem;
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.invoice-detail-screen {
+  padding: 12px;
+}
+
+.invoice-summary-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.invoice-summary-card > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.invoice-summary-card span,
+.invoice-summary-card dt {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.invoice-summary-card > div:first-child strong {
+  color: var(--primary-dark);
+  font-size: 1.55rem;
+  line-height: 1;
+}
+
+.invoice-summary-card dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.invoice-summary-card dl div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.invoice-summary-card dd {
+  margin: 0;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.compact-section-head {
+  margin-top: 12px;
+  align-items: center;
+}
+
+.invoice-item-card {
+  padding: 10px 12px;
+  box-shadow: none;
+}
+
+.invoice-item-main {
+  gap: 2px;
+}
+
+.barcode-copy {
+  width: fit-content;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-align: right;
+  cursor: copy;
+}
+
+.invoice-item-equation {
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 900;
 }
 
 .subheading {
@@ -1492,10 +1753,28 @@ h3 {
     width: 100%;
   }
 
+  .module-actions {
+    width: auto;
+    margin-inline-start: auto;
+  }
+
   .header-actions .button,
   .module-actions .button,
   .search-bar .button {
     flex: 1 1 auto;
+  }
+
+  .module-actions .button {
+    flex: 0 0 auto;
+  }
+
+  .module-back-button {
+    width: 40px;
+    padding-inline: 8px;
+  }
+
+  .module-back-button span {
+    display: none;
   }
 
   .search-bar {

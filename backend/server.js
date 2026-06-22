@@ -201,6 +201,14 @@ app.get(
 );
 
 app.get(
+  '/api/supplier/:id/diagnostics',
+  asyncRoute(async (req, res) => {
+    const diagnostics = await almohasebProfile.getSupplierDiagnostics(req.params.id);
+    res.json({ success: true, profile: 'almohaseb', diagnostics });
+  })
+);
+
+app.get(
   '/api/customer/:id',
   asyncRoute(async (req, res) => {
     const customer = await almohasebProfile.getCustomer(req.params.id);
@@ -276,10 +284,22 @@ app.get(
 );
 
 app.get(
+  '/api/trading-profit-debug',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getTradingProfitDebug({
+      date: req.query.date
+    });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
   '/api/revenue-details',
   asyncRoute(async (req, res) => {
     const result = await almohasebProfile.getRevenueDetails({
       date: req.query.date,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
       sellerId: req.query.sellerId,
       period: req.query.period,
       paymentMethod: req.query.paymentMethod,

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeft,
   ArrowRight,
   BadgeDollarSign,
   Barcode,
@@ -75,6 +76,13 @@ function formatDate(value) {
   return new Intl.DateTimeFormat('en-GB').format(date);
 }
 
+function formatShortDate(value) {
+  if (!value) return '-';
+  const parts = splitSqlDateTime(value);
+  if (parts) return `${parts.day}-${parts.month}-${parts.year}`;
+  return formatDate(value).replace(/\//g, '-');
+}
+
 function formatBusinessDateTime(dateValue, timeValue, hasRealTime) {
   const dateParts = splitSqlDateTime(dateValue);
   if (!dateParts) return formatDate(dateValue);
@@ -97,6 +105,14 @@ function todayInputValue() {
   return localDate.toISOString().slice(0, 10);
 }
 
+function shiftInputDate(value, days) {
+  const base = value ? new Date(`${value}T00:00:00`) : new Date();
+  if (Number.isNaN(base.getTime())) return todayInputValue();
+  base.setDate(base.getDate() + days);
+  const localDate = new Date(base.getTime() - base.getTimezoneOffset() * 60000);
+  return localDate.toISOString().slice(0, 10);
+}
+
 function exportRowsAsCsv(filename, headers, rows) {
   const csvRows = [
     headers.map((header) => header.label),
@@ -114,6 +130,31 @@ function exportRowsAsCsv(filename, headers, rows) {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(link.href);
+}
+
+function exportRowsAsExcel(filename, headers, rows) {
+  const tableRows = [
+    headers.map((header) => `<th>${escapeHtml(header.label)}</th>`).join(''),
+    ...rows.map((row) => headers.map((header) => {
+      const value = typeof header.value === 'function' ? header.value(row) : row[header.value];
+      return `<td>${escapeHtml(value ?? '')}</td>`;
+    }).join(''))
+  ].map((row) => `<tr>${row}</tr>`).join('');
+  const html = `<!doctype html><html><head><meta charset="utf-8" /></head><body><table>${tableRows}</table></body></html>`;
+  const blob = new Blob([html], { type: 'application/vnd.ms-excel;charset=utf-8;' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function sumBy(rows, field = 'amount') {
@@ -210,9 +251,9 @@ function FullPageState({ icon: Icon, title, message, action }) {
   );
 }
 
-function Button({ icon: Icon, children, variant = 'primary', ...props }) {
+function Button({ icon: Icon, children, variant = 'primary', className = '', ...props }) {
   return (
-    <button className={`button button-${variant}`} type="button" {...props}>
+    <button className={`button button-${variant} ${className}`.trim()} type="button" {...props}>
       {Icon ? <Icon size={20} aria-hidden="true" /> : null}
       <span>{children}</span>
     </button>
@@ -469,7 +510,7 @@ function ModuleShell({ title, icon: Icon, onBack, children, actions }) {
         </div>
         <div className="module-actions">
           {actions}
-          <Button icon={ArrowRight} variant="ghost" onClick={onBack}>رجوع</Button>
+          <Button icon={ArrowRight} variant="ghost" className="module-back-button" onClick={onBack}>رجوع</Button>
         </div>
       </div>
       {children}
@@ -537,6 +578,15 @@ function CustomersModule({ title, icon, onBack }) {
   }, [accountType]);
 
   const visibleAccounts = useMemo(() => prepareAccounts(accounts, { showArchived }), [accounts, showArchived]);
+  const exportVisibleAccounts = () => {
+    exportRowsAsExcel(`${isSupplier ? 'suppliers' : 'customers'}-balances-${todayInputValue()}.xlsx`, [
+      { label: isSupplier ? 'اسم المورد' : 'اسم الزبون', value: (row) => cleanAccountText(row.name) || '-' },
+      { label: 'رقم الهاتف إن وجد', value: (row) => cleanAccountText(row.phone) || '' },
+      { label: 'الرصيد', value: (row) => formatNumber(accountBalance(row)) },
+      { label: 'آخر حركة', value: (row) => formatDate(row.lastTransactionDate) },
+      { label: 'قيمة آخر حركة', value: (row) => formatNumber(row.lastTransactionAmount) }
+    ], visibleAccounts);
+  };
 
   return (
     <ModuleShell title={title} icon={icon} onBack={onBack}>
@@ -566,6 +616,9 @@ function CustomersModule({ title, icon, onBack }) {
               />
               <span>إظهار المؤرشف</span>
             </label>
+            <Button icon={FileSpreadsheet} variant="secondary" onClick={exportVisibleAccounts}>
+              تصدير Excel
+            </Button>
           </div>
 
           <SearchBar
@@ -972,15 +1025,44 @@ function TradingProfitModule({ title, icon, onBack }) {
   }, []);
 
   const summary = data?.summary || {};
+  const shiftTradingDates = (days) => {
+    setDateFrom((value) => shiftInputDate(value, days));
+    setDateTo((value) => shiftInputDate(value, days));
+  };
+  const exportTradingRows = () => {
+    exportRowsAsCsv(`trading-profit-${dateFrom}-${dateTo}.csv`, [
+      { label: 'التاريخ', value: (row) => formatDate(row.date) },
+      { label: 'المستخدم', value: 'description' },
+      { label: 'الإيراد', value: 'amount' },
+      { label: 'الربح', value: 'profit' },
+      { label: 'التكلفة', value: 'cost' }
+    ], data?.movements || []);
+  };
 
   return (
-    <ModuleShell title={title} icon={icon} onBack={onBack}>
-      <div className="report-toolbar">
-        <label>
+    <ModuleShell
+      title={title}
+      icon={icon}
+      onBack={onBack}
+      actions={(
+        <div className="revenue-actions compact-icon-actions">
+          <Button icon={Printer} variant="ghost" className="icon-action" title="طباعة PDF" onClick={() => window.print()}>PDF</Button>
+          <Button icon={FileSpreadsheet} variant="secondary" className="icon-action" title="تصدير Excel" onClick={exportTradingRows}>Excel</Button>
+        </div>
+      )}
+    >
+      <div className="report-toolbar compact-report-toolbar">
+        <button className="day-nav-button prev-day-button" type="button" onClick={() => shiftTradingDates(-1)} title="اليوم السابق">
+          <ArrowRight size={18} />
+        </button>
+        <button className="day-nav-button next-day-button" type="button" onClick={() => shiftTradingDates(1)} title="اليوم التالي">
+          <ArrowLeft size={18} />
+        </button>
+        <label className="date-from-field">
           <span>من تاريخ</span>
           <input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
         </label>
-        <label>
+        <label className="date-to-field">
           <span>إلى تاريخ</span>
           <input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
         </label>
@@ -988,23 +1070,13 @@ function TradingProfitModule({ title, icon, onBack }) {
       </div>
 
       <AsyncBlock loading={loading} error={error} empty={!data}>
-        <section className="trading-hero">
-          <div>
-            <p className="eyebrow">ملخص الفترة</p>
-            <h3>صافي الربح</h3>
-          </div>
-          <strong className={Number(summary.netProfit || 0) >= 0 ? 'is-positive' : 'is-negative'}>
-            {formatNumber(summary.netProfit)}
-          </strong>
-        </section>
-
         <div className="summary-grid">
-          <SummaryCard label="الإيرادات" value={formatNumber(summary.revenue)} />
-          <SummaryCard label="تكلفة البضاعة" value={formatNumber(summary.costOfGoods)} />
-          <SummaryCard label="مجمل الربح" value={formatNumber(summary.grossProfit)} />
-          <SummaryCard label="سدادات الموردين" value={formatNumber(summary.supplierPayments)} />
-          <SummaryCard label="المصاريف" value={formatNumber(summary.expenses)} />
-          <SummaryCard label="صافي الربح" value={formatNumber(summary.netProfit)} />
+          <SummaryCard icon={BadgeDollarSign} label="الإيرادات" value={formatNumber(summary.revenue)} />
+          <SummaryCard icon={Package} label="تكلفة البضاعة" value={formatNumber(summary.costOfGoods)} />
+          <SummaryCard icon={ClipboardList} label="مجمل الربح" value={formatNumber(summary.grossProfit)} />
+          <SummaryCard icon={FileSpreadsheet} label="سدادات الموردين" value={formatNumber(summary.supplierPayments)} />
+          <SummaryCard icon={AlertTriangle} label="المصاريف" value={formatNumber(summary.expenses)} />
+          <SummaryCard icon={CheckCircle2} label="صافي الربح" value={formatNumber(summary.netProfit)} highlight />
         </div>
 
         <section className="drill-section">
@@ -1115,7 +1187,8 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
   const [loading, setLoading] = useState(true);
   const [periodLoading, setPeriodLoading] = useState(false);
   const [error, setError] = useState('');
-  const [date, setDate] = useState(todayInputValue());
+  const [dateFrom, setDateFrom] = useState(todayInputValue());
+  const [dateTo, setDateTo] = useState(todayInputValue());
   const [periodFilter, setPeriodFilter] = useState('');
   const [selectedPeriod, setSelectedPeriod] = useState(null);
   const [selectedSource, setSelectedSource] = useState(null);
@@ -1132,12 +1205,12 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
     setPeriodData(null);
     try {
       const [result, dashboardResult] = await Promise.all([
-        api.revenueDetails({ date, period: periodFilter }),
-        api.salesToday(date)
+        api.revenueDetails({ dateFrom, dateTo, period: periodFilter }),
+        dateFrom === dateTo ? api.salesToday(dateFrom) : Promise.resolve(null)
       ]);
       setData(result);
       setDashboardReference(dashboardResult);
-      api.revenueDiagnostics(date)
+      api.revenueDiagnostics(dateFrom)
         .then(setDiagnostics)
         .catch(() => setDiagnostics(null));
     } catch (requestError) {
@@ -1151,7 +1224,7 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
 
   useEffect(() => {
     loadOverview();
-  }, [date, periodFilter]);
+  }, [dateFrom, dateTo, periodFilter]);
 
   const periodOptions = useMemo(() => {
     const fixed = ['الفترة الصباحية', 'الفترة المسائية', 'الفترة الليلية'];
@@ -1188,7 +1261,7 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
     setMovementError('');
     setPeriodLoading(true);
     try {
-      const result = await api.revenueDetails({ date, period: periodName });
+      const result = await api.revenueDetails({ dateFrom, dateTo, period: periodName });
       setPeriodData(result);
     } catch (requestError) {
       setError(requestError.message);
@@ -1230,6 +1303,10 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
       setMovementLoading(false);
     }
   };
+  const shiftRevenueDates = (days) => {
+    setDateFrom((value) => shiftInputDate(value, days));
+    setDateTo((value) => shiftInputDate(value, days));
+  };
 
   const sourceRows = periodData?.sources || [];
   const selectedMovements = useMemo(() => {
@@ -1242,7 +1319,7 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
 
   const exportVisibleRows = () => {
     const rows = selectedSource ? selectedMovements : selectedPeriod ? (periodData?.rows || []) : (data?.rows || []);
-    exportRowsAsCsv(`revenue-${date || 'today'}.csv`, [
+    exportRowsAsCsv(`revenue-${dateFrom || 'today'}-${dateTo || dateFrom || 'today'}.csv`, [
       { label: 'رقم الحركة', value: 'movementNo' },
       { label: 'رقم الفاتورة', value: 'invoiceNo' },
       { label: 'تاريخ الحركة', value: (row) => formatMovementDate(row) },
@@ -1263,18 +1340,28 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
       icon={icon}
       onBack={onBack}
       actions={(
-        <div className="revenue-actions">
-          <Button icon={Printer} variant="ghost" onClick={() => window.print()}>طباعة PDF</Button>
-          <Button icon={FileSpreadsheet} variant="secondary" onClick={exportVisibleRows}>تصدير Excel</Button>
+        <div className="revenue-actions compact-icon-actions">
+          <Button icon={Printer} variant="ghost" className="icon-action" title="طباعة PDF" onClick={() => window.print()}>PDF</Button>
+          <Button icon={FileSpreadsheet} variant="secondary" className="icon-action" title="تصدير Excel" onClick={exportVisibleRows}>Excel</Button>
         </div>
       )}
     >
-      <div className="report-toolbar">
-        <label>
-          <span>التاريخ</span>
-          <input type="date" value={date} onChange={(event) => setDate(event.target.value)} />
+      <div className="report-toolbar compact-report-toolbar revenue-filter-toolbar">
+        <button className="day-nav-button prev-day-button" type="button" onClick={() => shiftRevenueDates(-1)} title="اليوم السابق">
+          <ArrowRight size={18} />
+        </button>
+        <button className="day-nav-button next-day-button" type="button" onClick={() => shiftRevenueDates(1)} title="اليوم التالي">
+          <ArrowLeft size={18} />
+        </button>
+        <label className="date-from-field">
+          <span>من تاريخ</span>
+          <input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
         </label>
-        <label>
+        <label className="date-to-field">
+          <span>إلى تاريخ</span>
+          <input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
+        </label>
+        <label className="filter-wide">
           <span>الفترة</span>
           <select value={periodFilter} onChange={(event) => setPeriodFilter(event.target.value)}>
             <option value="">الكل</option>
@@ -1283,6 +1370,7 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
             ))}
           </select>
         </label>
+        <Button icon={RefreshCcw} variant="secondary" onClick={loadOverview}>تحديث التقرير</Button>
       </div>
 
       <AsyncBlock loading={loading} error={error} empty={!data}>
@@ -1328,12 +1416,11 @@ function RevenueDrilldownModule({ title, icon, onBack }) {
             <RevenueDiagnosticsPanel diagnostics={diagnostics} />
 
             <div className="summary-grid">
-              <SummaryCard label="صافي الإيراد النهائي" value={formatNumber(summary.netRevenue)} />
-              <SummaryCard label="إجمالي المبيعات النقدية" value={formatNumber(summary.cashSalesTotal)} />
-              <SummaryCard label="إجمالي سداد المدينين" value={formatNumber(summary.debtorPaymentsTotal)} />
-              <SummaryCard label="إجمالي المدفوعات الإلكترونية" value={formatNumber(summary.electronicPaymentsTotal)} />
-              <SummaryCard label="إجمالي المردودات" value={formatNumber(summary.returnsTotal)} />
-              <SummaryCard label="عدد الحركات" value={formatNumber(summary.movementCount)} />
+              <SummaryCard icon={CheckCircle2} label="صافي الإيراد النهائي" value={formatNumber(summary.netRevenue)} highlight />
+              <SummaryCard icon={BadgeDollarSign} label="إجمالي المبيعات النقدية" value={formatNumber(summary.cashSalesTotal)} />
+              <SummaryCard icon={Users} label="إجمالي سداد المدينين" value={formatNumber(summary.debtorPaymentsTotal)} />
+              <SummaryCard icon={FileSpreadsheet} label="إجمالي المدفوعات الإلكترونية" value={formatNumber(summary.electronicPaymentsTotal)} />
+              <SummaryCard icon={AlertTriangle} label="إجمالي المردودات" value={formatNumber(summary.returnsTotal)} />
             </div>
           </>
         ) : null}
@@ -1450,46 +1537,30 @@ function MovementCardList({ rows, onOpenMovement }) {
   return (
     <div className="movement-card-list">
       {rows.map((row) => (
-        <article className="movement-card" key={row.movementNo}>
-          <div className="movement-card-head">
+        <article
+          className="movement-card movement-slim-card"
+          key={row.movementNo}
+          role="button"
+          tabIndex={0}
+          onClick={() => onOpenMovement(row.movementNo)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') onOpenMovement(row.movementNo);
+          }}
+        >
+          <div className="movement-slim-main">
             <div>
               <strong>{row.movementType || '-'}</strong>
-              <span>{formatMovementDate(row)}</span>
+              <span>{formatShortDate(row.movementDate)}</span>
             </div>
-            <strong className={Number(row.amount || 0) < 0 ? 'is-negative' : ''}>{formatNumber(row.amount)}</strong>
+            <div>
+              <span>العميل: {row.customerName || '-'}</span>
+              <span>{row.invoiceNo ? `فاتورة #${row.invoiceNo}` : 'بدون فاتورة'}</span>
+            </div>
           </div>
-          <dl className="movement-card-fields">
-            <div>
-              <dt>طريقة الدفع</dt>
-              <dd>{row.paymentMethod || '-'}</dd>
-            </div>
-            <div>
-              <dt>اسم العميل</dt>
-              <dd>{row.customerName || '-'}</dd>
-            </div>
-            <div>
-              <dt>الفترة</dt>
-              <dd>{row.period || '-'}</dd>
-            </div>
-            <div>
-              <dt>رقم الفاتورة</dt>
-              <dd>
-                {row.invoiceNo ? (
-                  <button className="link-button" type="button" onClick={() => onOpenMovement(row.movementNo)}>
-                    {row.invoiceNo}
-                  </button>
-                ) : '-'}
-              </dd>
-            </div>
-            <div>
-              <dt>رقم الحركة</dt>
-              <dd>
-                <button className="link-button" type="button" onClick={() => onOpenMovement(row.movementNo)}>
-                  {row.movementNo}
-                </button>
-              </dd>
-            </div>
-          </dl>
+          <div className="movement-slim-amount">
+            <strong className={Number(row.amount || 0) < 0 ? 'is-negative' : ''}>{formatNumber(row.amount)}</strong>
+            <span>{row.paymentMethod || '-'}</span>
+          </div>
         </article>
       ))}
     </div>
@@ -1536,30 +1607,28 @@ function RevenueMovementDetails({ selectedMovement }) {
 
   return (
     <section className="detail-drawer invoice-detail-screen">
-      <div className="invoice-detail-head">
-        <Eye size={22} />
+      <div className="invoice-summary-card">
         <div>
-          <p className="eyebrow">تفاصيل الفاتورة</p>
-          <h3>الفاتورة {movement.invoiceNo || movement.movementNo}</h3>
+          <span>الإجمالي</span>
+          <strong>{formatNumber(movement.amount)}</strong>
         </div>
+        <dl>
+          <div><dt>العميل</dt><dd>{movement.customerName || '-'}</dd></div>
+          <div><dt>التاريخ والوقت</dt><dd>{formatInvoiceDate(movement)}</dd></div>
+          <div><dt>نوع الحركة</dt><dd>{movement.accountName || movement.movementType || '-'}</dd></div>
+          <div><dt>طريقة الدفع</dt><dd>{movement.paymentMethod || '-'}</dd></div>
+          <div><dt>رقم الفاتورة</dt><dd>{movement.invoiceNo || '-'}</dd></div>
+          <div><dt>رقم الحركة</dt><dd>{movement.movementNo || '-'}</dd></div>
+          {movement.discount ? <div><dt>الخصم</dt><dd>{formatNumber(movement.discount)}</dd></div> : null}
+          {(movement.notes || movement.invoiceDetails) ? <div><dt>ملاحظات</dt><dd>{movement.notes || movement.invoiceDetails}</dd></div> : null}
+        </dl>
       </div>
 
-      <div className="invoice-info-grid">
-        <InfoPill label="رقم الفاتورة" value={movement.invoiceNo || '-'} />
-        <InfoPill label="تاريخ الفاتورة" value={formatInvoiceDate(movement)} />
-        <InfoPill label="نوع الحركة" value={movement.accountName || movement.movementType || '-'} />
-        <InfoPill label="اسم العميل" value={movement.customerName || '-'} />
-        <InfoPill label="الفترة" value={movement.sellerName || movement.period || '-'} />
-        <InfoPill label="طريقة الدفع" value={movement.paymentMethod || '-'} />
-        <InfoPill label="الإجمالي" value={formatNumber(movement.amount)} />
-        <InfoPill label="الخصم" value={movement.discount ? formatNumber(movement.discount) : '-'} />
-        <InfoPill label="الملاحظات" value={movement.notes || movement.invoiceDetails || '-'} />
-      </div>
-
-      <div className="section-title-row">
+      <div className="invoice-detail-head compact-section-head">
+        <Eye size={18} />
         <div>
           <p className="eyebrow">الأصناف</p>
-          <h3>بنود الفاتورة الأصلية</h3>
+          <h3>بنود الفاتورة</h3>
         </div>
         <span className="count-badge">{formatNumber(invoiceLines.length)}</span>
       </div>
@@ -1609,26 +1678,20 @@ function InvoiceItemCards({ rows }) {
           <article className="invoice-item-card" key={row.detailNo}>
             <div className="invoice-item-main">
               <strong>{row.itemName || '-'}</strong>
-              <span>{row.barcode || '-'}</span>
+              {row.barcode ? (
+                <button
+                  className="barcode-copy"
+                  type="button"
+                  title="نسخ الباركود"
+                  onClick={() => navigator.clipboard?.writeText(String(row.barcode))}
+                >
+                  {row.barcode}
+                </button>
+              ) : <span>-</span>}
             </div>
-            <dl className="invoice-item-fields">
-              <div>
-                <dt>الكمية</dt>
-                <dd>{formatNumber(row.quantity)}</dd>
-              </div>
-              <div>
-                <dt>العبوة/الوحدة</dt>
-                <dd>{row.unit || '-'}</dd>
-              </div>
-              <div>
-                <dt>السعر</dt>
-                <dd>{formatNumber(unitPrice)}</dd>
-              </div>
-              <div>
-                <dt>الإجمالي</dt>
-                <dd>{formatNumber(row.chargeValue)}</dd>
-              </div>
-            </dl>
+            <div className="invoice-item-equation">
+              {formatNumber(row.quantity)} × {formatNumber(unitPrice)} = <strong>{formatNumber(row.chargeValue)}</strong>
+            </div>
           </article>
         );
       })}
@@ -1931,9 +1994,10 @@ function RevenueDetailsModule({ title, icon, onBack }) {
   );
 }
 
-function SummaryCard({ label, value }) {
+function SummaryCard({ label, value, icon: Icon = BadgeDollarSign, highlight = false }) {
   return (
-    <div className="summary-card">
+    <div className={`summary-card ${highlight ? 'is-highlight' : ''}`}>
+      <Icon size={16} />
       <span>{label}</span>
       <strong>{value}</strong>
     </div>

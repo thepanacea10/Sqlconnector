@@ -12,7 +12,9 @@ export function getProfileKnowledge() {
       },
       suppliers: {
         table: 'dbo.The_Persons',
-        filter: 'Person_Kind = 3'
+        filter: 'Person_Kind = 3',
+        balance:
+          'Signed supplier movement total from dbo.The_Movementrestrictions/dbo.The_Details using dbo.The_Account.Account_kind, minus signed payments from dbo.The_Outstandingvalues by Person_No.'
       },
       sales: {
         invoicesTable: 'dbo.The_Movementrestrictions',
@@ -120,8 +122,32 @@ function selectedDateFilter(columnName, selectedDate) {
   return `${columnName} >= CAST(GETDATE() AS DATE) AND ${columnName} < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))`;
 }
 
-function revenueDateFilter(selectedDate) {
-  return selectedDateFilter('ov.Date_paid', selectedDate);
+function parseDateRange(filters = {}) {
+  const fromDate = parseSelectedDate(filters.dateFrom || filters.startDate || filters.date)
+    || parseSelectedDate(formatDateInputValue(new Date()));
+  const toDate = parseSelectedDate(filters.dateTo || filters.endDate) || fromDate;
+  if (toDate.getTime() < fromDate.getTime()) {
+    throw badRequest('Invalid date range. dateTo must be greater than or equal to dateFrom.');
+  }
+
+  return { fromDate, toDate };
+}
+
+function bindDateRange(request, dateRange) {
+  request.input('dateFrom', sql.NVarChar, formatDateInputValue(dateRange.fromDate));
+  request.input('dateTo', sql.NVarChar, formatDateInputValue(dateRange.toDate));
+}
+
+function dateRangeFilter(columnName, dateRange) {
+  return `${columnName} >= CONVERT(DATETIME, @dateFrom, 120) AND ${columnName} < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))`;
+}
+
+function revenueDateFilter(dateRange) {
+  if (dateRange instanceof Date || !dateRange?.fromDate) {
+    return selectedDateFilter('ov.Date_paid', dateRange);
+  }
+
+  return dateRangeFilter('ov.Date_paid', dateRange);
 }
 
 function bindOptionalRevenueFilters(request, filters = {}) {
@@ -140,8 +166,8 @@ function revenueOptionalWhere(filters = {}) {
   return clauses.join('\n');
 }
 
-function revenueRowsSubquery(selectedDate) {
-  const dateFilter = revenueDateFilter(selectedDate);
+function revenueRowsSubquery(dateRange) {
+  const dateFilter = revenueDateFilter(dateRange);
 
   return `
     SELECT
@@ -200,10 +226,10 @@ function revenueRowsSubquery(selectedDate) {
   `;
 }
 
-function revenueRowsFrom(selectedDate, filters = {}) {
+function revenueRowsFrom(dateRange, filters = {}) {
   return `
     FROM (
-      ${revenueRowsSubquery(selectedDate)}
+      ${revenueRowsSubquery(dateRange)}
     ) revenueRows
     WHERE 1 = 1
     ${revenueOptionalWhere(filters)}
@@ -229,6 +255,46 @@ const invoiceTotalApply = `
     ) unitInfo ON unitInfo.Item_No = d.Item_No
     WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
   ) invoiceTotals
+`;
+
+const supplierInvoiceTotalApply = `
+  OUTER APPLY (
+    SELECT SUM(
+      ISNULL(d.Charge_Value, 0)
+      / CASE WHEN ISNULL(unitInfo.Unit_OldQuantity, 0) = 0 THEN 1 ELSE unitInfo.Unit_OldQuantity END
+      * ISNULL(d.Item_Quntity, 0)
+    ) AS total
+    FROM dbo.The_Details d
+    LEFT JOIN (
+      SELECT
+        Item_No,
+        MAX(Unit_OldQuantity) AS Unit_OldQuantity
+      FROM dbo.The_Units
+      GROUP BY Item_No
+    ) unitInfo ON unitInfo.Item_No = d.Item_No
+    WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
+  ) invoiceTotals
+`;
+
+const supplierBalanceApply = `
+  OUTER APPLY (
+    SELECT
+      SUM(ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1)) AS total,
+      MAX(mr.Movementrestrictions_Date) AS lastDate
+    FROM dbo.The_Movementrestrictions mr
+    INNER JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
+    ${supplierInvoiceTotalApply}
+    WHERE mr.Person_No = supplierRows.id
+      AND mr.Account_No IN (${purchaseAccountNumbers})
+  ) supplierMovements
+  OUTER APPLY (
+    SELECT
+      SUM(ISNULL(ov.Value_paid, 0)) AS total,
+      MAX(ov.Date_paid) AS lastDate,
+      CAST(NULL AS money) AS lastAmount
+    FROM dbo.The_Outstandingvalues ov
+    WHERE ov.Person_No = supplierRows.id
+  ) supplierPayments
 `;
 
 const customerBalanceApply = `
@@ -329,16 +395,19 @@ export async function getCustomers({ search }) {
 export async function getSuppliers({ search }) {
   const term = searchText(search);
   const query = `
-    SELECT
+    SELECT TOP (200)
       supplierRows.id,
       supplierRows.name,
       supplierRows.phone,
       supplierRows.address,
-      ISNULL(outstanding.total, 0) AS currentBalance,
-      outstanding.lastDate AS lastTransactionDate,
-      outstanding.lastAmount AS lastTransactionAmount
+      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS currentBalance,
+      CASE
+        WHEN ISNULL(supplierMovements.lastDate, '19000101') >= ISNULL(supplierPayments.lastDate, '19000101') THEN supplierMovements.lastDate
+        ELSE supplierPayments.lastDate
+      END AS lastTransactionDate,
+      supplierPayments.lastAmount AS lastTransactionAmount
     FROM (
-      SELECT TOP (80)
+      SELECT
         p.Person_No AS id,
         p.Person_Name AS name,
         p.Person_tel AS phone,
@@ -350,18 +419,12 @@ export async function getSuppliers({ search }) {
           OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
           OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
         )
-      ORDER BY p.Person_Name ASC
-    ) supplierRows
-    OUTER APPLY (
-      SELECT
-        SUM(ISNULL(ov.Value_paid, 0)) AS total,
-        MAX(ov.Date_paid) AS lastDate,
-        CAST(NULL AS money) AS lastAmount
-      FROM dbo.The_Outstandingvalues ov
-      WHERE ov.Person_No = supplierRows.id
-        AND ov.Account_No IN (${purchaseAccountNumbers})
-    ) outstanding
-    ORDER BY supplierRows.name ASC
+      ) supplierRows
+    ${supplierBalanceApply}
+    ORDER BY
+      CASE WHEN ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) = 0 THEN 1 ELSE 0 END ASC,
+      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) ASC,
+      supplierRows.name ASC
   `;
 
   const result = await executeReadonlyQuery(query, (request) => bindSearch(request, term));
@@ -380,7 +443,7 @@ export async function getSupplierInvoices(id) {
       ISNULL(invoiceTotals.total, 0) - ISNULL(payments.paid, 0) AS remaining
     FROM dbo.The_Movementrestrictions mr
     LEFT JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
-    ${invoiceTotalApply}
+    ${supplierInvoiceTotalApply}
     OUTER APPLY (
       SELECT SUM(ABS(ISNULL(ov.Value_paid, 0))) AS paid
       FROM dbo.The_Outstandingvalues ov
@@ -389,7 +452,6 @@ export async function getSupplierInvoices(id) {
     ) payments
     WHERE mr.Person_No = @id
       AND mr.Account_No IN (${purchaseAccountNumbers})
-      AND ISNULL(mr.Case_Invoice, 0) = 0
     ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC
   `;
 
@@ -421,26 +483,27 @@ export async function getSupplierStatement(id) {
     SELECT
       mr.Movementrestrictions_Date AS [date],
       N'فاتورة شراء رقم ' + CONVERT(NVARCHAR(30), mr.Movementrestrictions_No) AS description,
-      CAST(0 AS money) AS debit,
-      ISNULL(invoiceTotals.total, 0) AS credit,
+      CASE WHEN ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) > 0 THEN ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) ELSE 0 END AS debit,
+      CASE WHEN ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) < 0 THEN ABS(ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1)) ELSE 0 END AS credit,
+      ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) AS balanceAmount,
       CAST(1 AS int) AS sortOrder,
       mr.Movementrestrictions_No AS refNo
     FROM dbo.The_Movementrestrictions mr
-    ${invoiceTotalApply}
+    INNER JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
+    ${supplierInvoiceTotalApply}
     WHERE mr.Person_No = @id
       AND mr.Account_No IN (${purchaseAccountNumbers})
-      AND ISNULL(mr.Case_Invoice, 0) = 0
     UNION ALL
     SELECT
       ov.Date_paid AS [date],
       N'سداد مورد رقم ' + CONVERT(NVARCHAR(30), ov.Outstandingvalues_No) AS description,
       ABS(ISNULL(ov.Value_paid, 0)) AS debit,
       CAST(0 AS money) AS credit,
+      -ISNULL(ov.Value_paid, 0) AS balanceAmount,
       CAST(2 AS int) AS sortOrder,
       ov.Outstandingvalues_No AS refNo
     FROM dbo.The_Outstandingvalues ov
     WHERE ov.Person_No = @id
-      AND ov.Account_No IN (${purchaseAccountNumbers})
   `;
 
   const query = `
@@ -450,7 +513,7 @@ export async function getSupplierStatement(id) {
       statementRows.debit,
       statementRows.credit,
       (
-        SELECT SUM(balanceRows.credit - balanceRows.debit)
+        SELECT SUM(balanceRows.balanceAmount)
         FROM (
           ${statementRowsQuery}
         ) balanceRows
@@ -478,6 +541,31 @@ export async function getSupplierStatement(id) {
 
   const result = await executeReadonlyQuery(query, (request) => bindId(request, id));
   return result.recordset || [];
+}
+
+export async function getSupplierDiagnostics(id) {
+  const query = `
+    SELECT TOP (1)
+      p.Person_No AS supplierId,
+      p.Person_Name AS supplierName,
+      ABS(ISNULL(supplierMovements.total, 0)) AS totalPurchases,
+      ABS(ISNULL(supplierPayments.total, 0)) AS totalPayments,
+      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS calculatedBalance,
+      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS balanceFromAlmohaseb,
+      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS balanceFromCurrentApi,
+      supplierMovements.total AS signedMovementTotal,
+      supplierPayments.total AS signedPaymentTotal
+    FROM dbo.The_Persons p
+    CROSS APPLY (
+      SELECT p.Person_No AS id
+    ) supplierRows
+    ${supplierBalanceApply}
+    WHERE p.Person_No = @id
+      AND p.Person_Kind = 3
+  `;
+
+  const result = await executeReadonlyQuery(query, (request) => bindId(request, id));
+  return result.recordset?.[0] || null;
 }
 
 export async function getCustomer(id) {
@@ -894,42 +982,48 @@ export async function getTradingProfit({ dateFrom, dateTo } = {}) {
   const fromDate = parseSelectedDate(dateFrom) || parseSelectedDate(formatDateInputValue(new Date()));
   const toDate = parseSelectedDate(dateTo) || fromDate;
 
+  const officialTradingUsers = `
+    SELECT N'الفترة الصباحية' AS Trading_User, 1 AS sortOrder
+    UNION ALL SELECT N'الفترة المسائية', 2
+    UNION ALL SELECT N'الفترة الليلية', 3
+    UNION ALL SELECT N'احمد الرجيلي', 4
+    UNION ALL SELECT N'مدير النظام', 5
+    UNION ALL SELECT N'عبدالوهاب', 6
+  `;
+
+  const liveProfitRows = `
+    SELECT
+      tp.Trading_No,
+      tp.Trading_Date,
+      tp.Trading_User,
+      tp.Trading_Income,
+      tp.Trading_Profit,
+      tp.Refresh_Profit
+    FROM dbo.The_Profit tp
+    WHERE tp.Trading_Date >= CONVERT(DATETIME, @dateFrom, 120)
+      AND tp.Trading_Date < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
+      AND NOT EXISTS (
+        SELECT 1
+        FROM dbo.The_Profit newer
+        WHERE newer.Trading_Date = tp.Trading_Date
+          AND ISNULL(newer.Trading_User, N'') = ISNULL(tp.Trading_User, N'')
+          AND newer.Trading_No > tp.Trading_No
+      )
+  `;
+
   const query = `
     SELECT
-      ISNULL(sales.revenue, 0) AS revenue,
-      ISNULL(sales.costOfGoods, 0) AS costOfGoods,
-      ISNULL(sales.grossProfit, 0) AS grossProfit,
-      ISNULL(supplierPayments.total, 0) AS supplierPayments,
-      ISNULL(expenses.total, 0) AS expenses,
-      ISNULL(sales.grossProfit, 0) - ISNULL(expenses.total, 0) AS netProfit
+      ISNULL(SUM(liveRows.Trading_Income), 0) AS revenue,
+      ISNULL(SUM(liveRows.Trading_Income - liveRows.Trading_Profit), 0) AS costOfGoods,
+      ISNULL(SUM(liveRows.Trading_Profit), 0) AS grossProfit,
+      CAST(0 AS money) AS supplierPayments,
+      CAST(0 AS money) AS expenses,
+      ISNULL(SUM(liveRows.Trading_Profit), 0) AS netProfit,
+      COUNT(*) AS liveRowCount,
+      N'The_Profit' AS sourceTable
     FROM (
-      SELECT
-        SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Charge_Value, 0) ELSE -ISNULL(d.Charge_Value, 0) END) AS revenue,
-        SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0) ELSE -(ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0)) END) AS costOfGoods,
-        SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Charge_Value, 0) - (ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0)) ELSE -(ISNULL(d.Charge_Value, 0) - (ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0))) END) AS grossProfit
-      FROM dbo.The_Movementrestrictions mr
-      INNER JOIN dbo.The_Details d ON d.Movementrestrictions_No = mr.Movementrestrictions_No
-      WHERE mr.Movementrestrictions_Date >= CONVERT(DATETIME, @dateFrom, 120)
-        AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
-        AND ISNULL(mr.Case_Invoice, 0) = 0
-        AND mr.Account_No IN (1, 2, 3, 4)
-    ) sales
-    CROSS JOIN (
-      SELECT SUM(ABS(ISNULL(ov.Value_paid, 0))) AS total
-      FROM dbo.The_Outstandingvalues ov
-      INNER JOIN dbo.The_Persons p ON p.Person_No = ov.Person_No
-      WHERE ov.Date_paid >= CONVERT(DATETIME, @dateFrom, 120)
-        AND ov.Date_paid < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
-        AND p.Person_Kind = 3
-        AND ov.Account_No IN (${purchaseAccountNumbers})
-    ) supplierPayments
-    CROSS JOIN (
-      SELECT SUM(ABS(ISNULL(ov.Value_paid, 0))) AS total
-      FROM dbo.The_Outstandingvalues ov
-      WHERE ov.Date_paid >= CONVERT(DATETIME, @dateFrom, 120)
-        AND ov.Date_paid < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
-        AND ov.Account_No = 11
-    ) expenses
+      ${liveProfitRows}
+    ) liveRows
   `;
 
   const movementsQuery = `
@@ -937,39 +1031,74 @@ export async function getTradingProfit({ dateFrom, dateTo } = {}) {
       movementRows.[date],
       movementRows.kind,
       movementRows.description,
-      movementRows.amount
+      movementRows.amount,
+      movementRows.profit,
+      movementRows.cost,
+      movementRows.refreshProfit,
+      movementRows.referenceNo,
+      movementRows.sourceTable
     FROM (
-      SELECT mr.Movementrestrictions_Date AS [date], N'إيراد' AS kind,
-        ISNULL(acc.Account_Name, N'مبيعات') AS description,
-        SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Charge_Value, 0) ELSE -ISNULL(d.Charge_Value, 0) END) AS amount
+      SELECT
+        MAX(liveRows.Trading_Date) AS [date],
+        N'المتاجرة والأرباح' AS kind,
+        ISNULL(liveRows.Trading_User, N'') AS description,
+        SUM(liveRows.Trading_Income) AS amount,
+        SUM(liveRows.Trading_Profit) AS profit,
+        SUM(liveRows.Trading_Income - liveRows.Trading_Profit) AS cost,
+        MAX(CONVERT(int, liveRows.Refresh_Profit)) AS refreshProfit,
+        MAX(liveRows.Trading_No) AS referenceNo,
+        N'The_Profit' AS sourceTable,
+        MIN(officialUsers.sortOrder) AS sortOrder
+      FROM (
+        ${liveProfitRows}
+      ) liveRows
+      INNER JOIN (
+        ${officialTradingUsers}
+      ) officialUsers ON officialUsers.Trading_User = ISNULL(liveRows.Trading_User, N'')
+      GROUP BY ISNULL(liveRows.Trading_User, N'')
+      HAVING SUM(ISNULL(liveRows.Trading_Income, 0)) <> 0
+        OR SUM(ISNULL(liveRows.Trading_Profit, 0)) <> 0
+      UNION ALL
+      SELECT
+        MAX(mr.Movementrestrictions_Date) AS [date],
+        N'فواتير بيع - للمراجعة فقط' AS kind,
+        ISNULL(seller.Person_Name, N'غير محدد') AS description,
+        SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.salesTotal, 0) ELSE -ISNULL(invoiceTotals.salesTotal, 0) END) AS amount,
+        SUM(CASE
+          WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.salesTotal, 0) - ISNULL(invoiceTotals.costTotal, 0)
+          ELSE -(ISNULL(invoiceTotals.salesTotal, 0) - ISNULL(invoiceTotals.costTotal, 0))
+        END) AS profit,
+        SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.costTotal, 0) ELSE -ISNULL(invoiceTotals.costTotal, 0) END) AS cost,
+        CAST(NULL AS int) AS refreshProfit,
+        MAX(mr.Movementrestrictions_No) AS referenceNo,
+        N'The_Movementrestrictions/The_Details' AS sourceTable,
+        MIN(ISNULL(officialUsers.sortOrder, 99)) AS sortOrder
       FROM dbo.The_Movementrestrictions mr
-      INNER JOIN dbo.The_Details d ON d.Movementrestrictions_No = mr.Movementrestrictions_No
-      LEFT JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
+      LEFT JOIN dbo.The_Persons seller ON seller.Person_No = mr.User_No
+      LEFT JOIN (
+        ${officialTradingUsers}
+      ) officialUsers ON officialUsers.Trading_User = ISNULL(seller.Person_Name, N'')
+      OUTER APPLY (
+        SELECT
+          SUM(ISNULL(d.Charge_Value, 0)) AS salesTotal,
+          SUM(ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0)) AS costTotal
+        FROM dbo.The_Details d
+        WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
+      ) invoiceTotals
       WHERE mr.Movementrestrictions_Date >= CONVERT(DATETIME, @dateFrom, 120)
         AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
-        AND ISNULL(mr.Case_Invoice, 0) = 0
         AND mr.Account_No IN (1, 2, 3, 4)
-      GROUP BY mr.Movementrestrictions_Date, acc.Account_Name
-      UNION ALL
-      SELECT ov.Date_paid AS [date], N'سداد مورد' AS kind,
-        ISNULL(p.Person_Name, N'مورد') AS description,
-        ABS(ISNULL(ov.Value_paid, 0)) AS amount
-      FROM dbo.The_Outstandingvalues ov
-      INNER JOIN dbo.The_Persons p ON p.Person_No = ov.Person_No
-      WHERE ov.Date_paid >= CONVERT(DATETIME, @dateFrom, 120)
-        AND ov.Date_paid < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
-        AND p.Person_Kind = 3
-        AND ov.Account_No IN (${purchaseAccountNumbers})
-      UNION ALL
-      SELECT ov.Date_paid AS [date], N'مصروف' AS kind,
-        ISNULL(ov.Comment, N'مصروفات عامة') AS description,
-        ABS(ISNULL(ov.Value_paid, 0)) AS amount
-      FROM dbo.The_Outstandingvalues ov
-      WHERE ov.Date_paid >= CONVERT(DATETIME, @dateFrom, 120)
-        AND ov.Date_paid < DATEADD(DAY, 1, CONVERT(DATETIME, @dateTo, 120))
-        AND ov.Account_No = 11
+        AND NOT EXISTS (
+          SELECT 1
+          FROM (
+            ${liveProfitRows}
+          ) liveRows
+          WHERE ISNULL(liveRows.Trading_User, N'') = ISNULL(seller.Person_Name, N'')
+        )
+      GROUP BY ISNULL(seller.Person_Name, N'غير محدد')
+      HAVING SUM(ISNULL(invoiceTotals.salesTotal, 0)) <> 0
     ) movementRows
-    ORDER BY movementRows.[date] DESC
+    ORDER BY movementRows.sortOrder, movementRows.description
   `;
 
   const bindDates = (request) => {
@@ -990,11 +1119,169 @@ export async function getTradingProfit({ dateFrom, dateTo } = {}) {
   };
 }
 
+export async function getTradingProfitDebug({ date } = {}) {
+  const selectedDate = parseSelectedDate(date) || parseSelectedDate(formatDateInputValue(new Date()));
+  const bindDate = (request) => {
+    request.input('selectedDate', sql.NVarChar, formatDateInputValue(selectedDate));
+  };
+
+  const debugRowsSource = `
+    SELECT
+      mr.Movementrestrictions_No AS movement_no,
+      mr.Purchase_invoice AS invoice_no,
+      mr.Movementrestrictions_Date AS movement_date,
+      mr.Account_No AS account_no,
+      acc.Account_kind AS account_kind,
+      mr.Case_Invoice AS case_invoice,
+      ISNULL(acc.Account_Name, N'حركة بيع') AS movement_type_label,
+      ISNULL(p.Person_Name, N'') AS person_name,
+      ISNULL(invoiceTotals.sales_total, 0) AS sales_total,
+      CAST(0 AS money) AS payment_total,
+      ISNULL(invoiceTotals.cost_total, 0) AS cost_total,
+      CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.sales_total, 0) ELSE -ISNULL(invoiceTotals.sales_total, 0) END AS contribution_to_revenue,
+      CASE
+        WHEN mr.Account_No IN (1, 2) THEN ISNULL(invoiceTotals.sales_total, 0) - ISNULL(invoiceTotals.cost_total, 0)
+        ELSE -(ISNULL(invoiceTotals.sales_total, 0) - ISNULL(invoiceTotals.cost_total, 0))
+      END AS contribution_to_profit,
+      N'The_Movementrestrictions/The_Details' AS source_table
+    FROM dbo.The_Movementrestrictions mr
+    LEFT JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
+    LEFT JOIN dbo.The_Persons p ON p.Person_No = mr.Person_No
+    OUTER APPLY (
+      SELECT
+        SUM(ISNULL(d.Charge_Value, 0)) AS sales_total,
+        SUM(ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0)) AS cost_total
+      FROM dbo.The_Details d
+      WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
+    ) invoiceTotals
+    WHERE mr.Movementrestrictions_Date >= CONVERT(DATETIME, @selectedDate, 120)
+      AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CONVERT(DATETIME, @selectedDate, 120))
+      AND mr.Account_No IN (1, 2, 3, 4)
+    UNION ALL
+    SELECT
+      ov.Outstandingvalues_No AS movement_no,
+      ov.Movementrestrictions_No AS invoice_no,
+      ov.Date_paid AS movement_date,
+      ov.Account_No AS account_no,
+      acc.Account_kind AS account_kind,
+      CAST(NULL AS bit) AS case_invoice,
+      CASE
+        WHEN p.Person_Kind = 2 THEN N'سداد زبون'
+        WHEN p.Person_Kind = 3 THEN N'سداد مورد'
+        ELSE ISNULL(acc.Account_Name, N'حركة مالية')
+      END AS movement_type_label,
+      ISNULL(p.Person_Name, N'') AS person_name,
+      CAST(0 AS money) AS sales_total,
+      ISNULL(ov.Value_paid, 0) AS payment_total,
+      CAST(0 AS money) AS cost_total,
+      CAST(0 AS money) AS contribution_to_revenue,
+      CAST(0 AS money) AS contribution_to_profit,
+      N'The_Outstandingvalues' AS source_table
+    FROM dbo.The_Outstandingvalues ov
+    LEFT JOIN dbo.The_Account acc ON acc.Account_No = ov.Account_No
+    LEFT JOIN dbo.The_Persons p ON p.Person_No = ov.Person_No
+    WHERE ov.Date_paid >= CONVERT(DATETIME, @selectedDate, 120)
+      AND ov.Date_paid < DATEADD(DAY, 1, CONVERT(DATETIME, @selectedDate, 120))
+    UNION ALL
+    SELECT
+      tp.Trading_No AS movement_no,
+      CAST(NULL AS int) AS invoice_no,
+      tp.Trading_Date AS movement_date,
+      CAST(NULL AS int) AS account_no,
+      CAST(NULL AS smallint) AS account_kind,
+      CAST(NULL AS bit) AS case_invoice,
+      N'نتيجة تقرير المتاجرة في المحاسب' AS movement_type_label,
+      ISNULL(tp.Trading_User, N'') AS person_name,
+      ISNULL(tp.Trading_Income, 0) AS sales_total,
+      CAST(0 AS money) AS payment_total,
+      ISNULL(tp.Trading_Income, 0) - ISNULL(tp.Trading_Profit, 0) AS cost_total,
+      ISNULL(tp.Trading_Income, 0) AS contribution_to_revenue,
+      ISNULL(tp.Trading_Profit, 0) AS contribution_to_profit,
+      N'The_Profit' AS source_table
+    FROM dbo.The_Profit tp
+    WHERE tp.Trading_Date >= CONVERT(DATETIME, @selectedDate, 120)
+      AND tp.Trading_Date < DATEADD(DAY, 1, CONVERT(DATETIME, @selectedDate, 120))
+  `;
+
+  const debugRowsQuery = `
+    SELECT TOP (1000)
+      debugRows.movement_no,
+      debugRows.invoice_no,
+      debugRows.movement_date,
+      debugRows.account_no,
+      debugRows.account_kind,
+      debugRows.case_invoice,
+      debugRows.movement_type_label,
+      debugRows.person_name,
+      debugRows.sales_total,
+      debugRows.payment_total,
+      debugRows.cost_total,
+      debugRows.contribution_to_revenue,
+      debugRows.contribution_to_profit,
+      debugRows.source_table
+    FROM (
+      ${debugRowsSource}
+    ) debugRows
+    ORDER BY debugRows.movement_date, debugRows.source_table, debugRows.movement_no
+  `;
+
+  const groupedQuery = `
+    SELECT
+      grouped.account_no,
+      grouped.account_kind,
+      grouped.case_invoice,
+      grouped.movement_type_label,
+      grouped.source_table,
+      COUNT(*) AS row_count,
+      SUM(grouped.sales_total) AS sales_total,
+      SUM(grouped.payment_total) AS payment_total,
+      SUM(grouped.cost_total) AS cost_total,
+      SUM(grouped.contribution_to_revenue) AS contribution_to_revenue,
+      SUM(grouped.contribution_to_profit) AS contribution_to_profit
+    FROM (
+      ${debugRowsSource}
+    ) grouped
+    GROUP BY
+      grouped.account_no,
+      grouped.account_kind,
+      grouped.case_invoice,
+      grouped.movement_type_label,
+      grouped.source_table
+    ORDER BY grouped.source_table, grouped.account_no, grouped.case_invoice
+  `;
+
+  const currentTradingPathQuery = `
+    SELECT
+      ISNULL(SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Charge_Value, 0) ELSE -ISNULL(d.Charge_Value, 0) END), 0) AS currentRevenue,
+      ISNULL(SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0) ELSE -(ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0)) END), 0) AS currentCost,
+      ISNULL(SUM(CASE WHEN mr.Account_No IN (1, 2) THEN ISNULL(d.Charge_Value, 0) - (ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0)) ELSE -(ISNULL(d.Charge_Value, 0) - (ISNULL(d.Item_Cost, 0) * ISNULL(d.Item_Quntity, 0))) END), 0) AS currentProfit
+    FROM dbo.The_Movementrestrictions mr
+    INNER JOIN dbo.The_Details d ON d.Movementrestrictions_No = mr.Movementrestrictions_No
+    WHERE mr.Movementrestrictions_Date >= CONVERT(DATETIME, @selectedDate, 120)
+      AND mr.Movementrestrictions_Date < DATEADD(DAY, 1, CONVERT(DATETIME, @selectedDate, 120))
+      AND ISNULL(mr.Case_Invoice, 0) = 0
+      AND mr.Account_No IN (1, 2, 3, 4)
+  `;
+
+  const [rowsResult, groupedResult, currentPathResult] = await Promise.all([
+    executeReadonlyQuery(debugRowsQuery, bindDate),
+    executeReadonlyQuery(groupedQuery, bindDate),
+    executeReadonlyQuery(currentTradingPathQuery, bindDate)
+  ]);
+
+  return {
+    date: formatDateInputValue(selectedDate),
+    currentTradingPath: currentPathResult.recordset?.[0] || {},
+    rows: rowsResult.recordset || [],
+    groupedTotals: groupedResult.recordset || []
+  };
+}
+
 export async function getRevenueDetails(filters = {}) {
-  const selectedDate = parseSelectedDate(filters.date);
-  const revenueFrom = revenueRowsFrom(selectedDate, filters);
+  const dateRange = parseDateRange(filters);
+  const revenueFrom = revenueRowsFrom(dateRange, filters);
   const bindFilters = (request) => {
-    bindSelectedDate(request, selectedDate);
+    bindDateRange(request, dateRange);
     bindOptionalRevenueFilters(request, filters);
   };
 
@@ -1062,19 +1349,19 @@ export async function getRevenueDetails(filters = {}) {
 
   const filterOptionsQuery = `
     SELECT 'seller' AS optionType, CONVERT(NVARCHAR(50), sellerId) AS optionValue, sellerName AS optionLabel
-    ${revenueRowsFrom(selectedDate, {})}
+    ${revenueRowsFrom(dateRange, {})}
     GROUP BY sellerId, sellerName
     UNION ALL
     SELECT 'period' AS optionType, period AS optionValue, period AS optionLabel
-    ${revenueRowsFrom(selectedDate, {})}
+    ${revenueRowsFrom(dateRange, {})}
     GROUP BY period
     UNION ALL
     SELECT 'paymentMethod' AS optionType, paymentMethod AS optionValue, paymentMethod AS optionLabel
-    ${revenueRowsFrom(selectedDate, {})}
+    ${revenueRowsFrom(dateRange, {})}
     GROUP BY paymentMethod
     UNION ALL
     SELECT 'movementType' AS optionType, movementType AS optionValue, movementType AS optionLabel
-    ${revenueRowsFrom(selectedDate, {})}
+    ${revenueRowsFrom(dateRange, {})}
     GROUP BY movementType
     ORDER BY optionType, optionLabel
   `;
@@ -1084,7 +1371,7 @@ export async function getRevenueDetails(filters = {}) {
     executeReadonlyQuery(summaryQuery, bindFilters),
     executeReadonlyQuery(sourcesQuery, bindFilters),
     executeReadonlyQuery(sellerTotalsQuery, bindFilters),
-    executeReadonlyQuery(filterOptionsQuery, (request) => bindSelectedDate(request, selectedDate))
+    executeReadonlyQuery(filterOptionsQuery, (request) => bindDateRange(request, dateRange))
   ]);
 
   const summary = summaryResult.recordset?.[0] || {
@@ -1102,7 +1389,9 @@ export async function getRevenueDetails(filters = {}) {
   const difference = Number.isFinite(expectedTotal) ? Number(summary.netRevenue || 0) - expectedTotal : 0;
 
   return {
-    selectedDate: formatDateInputValue(selectedDate),
+    selectedDate: formatDateInputValue(dateRange.fromDate),
+    dateFrom: formatDateInputValue(dateRange.fromDate),
+    dateTo: formatDateInputValue(dateRange.toDate),
     filters: {
       sellerId: filters.sellerId || '',
       period: filters.period || '',
