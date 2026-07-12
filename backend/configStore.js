@@ -19,6 +19,33 @@ function readNumber(value, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+const defaultSavedConnections = [
+  {
+    id: 'localhost-sqlexpress',
+    name: 'Localhost SQLEXPRESS',
+    server: 'localhost\\SQLEXPRESS',
+    database: 'AlmohasebSQL',
+    user: 'ah',
+    password: '123456',
+    port: null,
+    encrypt: false,
+    trustServerCertificate: true,
+    tdsVersion: '7_3_A'
+  },
+  {
+    id: 'desktop-sqlexpress',
+    name: 'DESKTOP SQLEXPRESS',
+    server: 'DESKTOP-7GFVGFG\\SQLEXPRESS',
+    database: 'AlmohasebSQL',
+    user: 'ah',
+    password: '123456',
+    port: null,
+    encrypt: false,
+    trustServerCertificate: true,
+    tdsVersion: '7_3_A'
+  }
+];
+
 export function normalizeConnectionSettings(input = {}) {
   const settings = {
     server: String(input.server ?? input.SQL_SERVER ?? '').trim(),
@@ -67,25 +94,97 @@ function envConnectionSettings() {
 async function readJson(filePath) {
   try {
     const raw = await fs.readFile(filePath, 'utf8');
-    return JSON.parse(raw);
+    return JSON.parse(raw.trimStart());
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
   }
 }
 
-export async function getConnectionSettings() {
-  const fromEnv = envConnectionSettings();
-  if (fromEnv) return fromEnv;
-
-  const fromFile = await readJson(connectionConfigPath);
-  return fromFile ? normalizeConnectionSettings(fromFile) : null;
+function connectionId(settings) {
+  return String(settings.id || `${settings.server}-${settings.database}`)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
 }
 
-export async function saveConnectionSettings(settings) {
-  const normalized = normalizeConnectionSettings(settings);
+function normalizeSavedConnection(input = {}) {
+  const normalized = normalizeConnectionSettings(input);
+  return {
+    id: connectionId(input),
+    name: String(input.name || input.label || input.server || 'SQL Server').trim(),
+    ...normalized
+  };
+}
+
+function publicSavedConnection(connection) {
+  return {
+    id: connection.id,
+    name: connection.name,
+    server: connection.server,
+    database: connection.database,
+    user: connection.user,
+    port: connection.port,
+    encrypt: connection.encrypt,
+    trustServerCertificate: connection.trustServerCertificate,
+    tdsVersion: connection.tdsVersion,
+    lastConnectionAt: connection.lastConnectionAt ?? null
+  };
+}
+
+function mergeConnections(...groups) {
+  const byId = new Map();
+  groups.flat().filter(Boolean).forEach((connection) => {
+    const normalized = normalizeSavedConnection(connection);
+    byId.set(normalized.id, { ...byId.get(normalized.id), ...normalized });
+  });
+  return Array.from(byId.values());
+}
+
+async function readConnectionConfig() {
+  const raw = await readJson(connectionConfigPath);
+  if (!raw) {
+    const savedConnections = mergeConnections(defaultSavedConnections);
+    return {
+      activeConnectionId: savedConnections[0]?.id ?? null,
+      activeConnection: savedConnections[0] ?? null,
+      savedConnections
+    };
+  }
+
+  if (Array.isArray(raw.savedConnections) || raw.activeConnection) {
+    const savedConnections = mergeConnections(defaultSavedConnections, raw.savedConnections || []);
+    const activeFromFile = raw.activeConnection ? normalizeSavedConnection(raw.activeConnection) : null;
+    const activeConnectionId = raw.activeConnectionId || activeFromFile?.id || savedConnections[0]?.id || null;
+    const activeConnection =
+      activeFromFile ||
+      savedConnections.find((connection) => connection.id === activeConnectionId) ||
+      savedConnections[0] ||
+      null;
+
+    return {
+      activeConnectionId: activeConnection?.id || activeConnectionId,
+      activeConnection,
+      savedConnections: mergeConnections(savedConnections, activeConnection ? [activeConnection] : [])
+    };
+  }
+
+  const legacyConnection = normalizeSavedConnection({
+    id: connectionId(raw),
+    name: raw.name || raw.server,
+    ...raw
+  });
+
+  return {
+    activeConnectionId: legacyConnection.id,
+    activeConnection: legacyConnection,
+    savedConnections: mergeConnections(defaultSavedConnections, [legacyConnection])
+  };
+}
+
+async function writeConnectionConfig(config) {
   await fs.mkdir(path.dirname(connectionConfigPath), { recursive: true });
-  await fs.writeFile(connectionConfigPath, JSON.stringify(normalized, null, 2), {
+  await fs.writeFile(connectionConfigPath, JSON.stringify(config, null, 2), {
     encoding: 'utf8',
     mode: 0o600
   });
@@ -95,8 +194,71 @@ export async function saveConnectionSettings(settings) {
   } catch {
     // Windows may ignore POSIX modes; the file remains backend-only and gitignored.
   }
+}
+
+export async function getConnectionSettings() {
+  const fromEnv = envConnectionSettings();
+  if (fromEnv) return fromEnv;
+
+  const config = await readConnectionConfig();
+  return config.activeConnection ? normalizeConnectionSettings(config.activeConnection) : null;
+}
+
+export async function saveConnectionSettings(settings) {
+  const config = await readConnectionConfig();
+  const requestedId = connectionId(settings);
+  const existing = config.savedConnections.find((connection) => connection.id === requestedId);
+  const mergedSettings = {
+    ...(existing || {}),
+    ...settings,
+    password: settings.password || existing?.password || ''
+  };
+  const normalized = normalizeSavedConnection(mergedSettings);
+  const savedConnections = mergeConnections(config.savedConnections, [normalized]);
+  await writeConnectionConfig({
+    activeConnectionId: normalized.id,
+    activeConnection: normalized,
+    savedConnections
+  });
 
   return normalized;
+}
+
+export async function getSavedConnections() {
+  const config = await readConnectionConfig();
+  return {
+    activeConnectionId: config.activeConnectionId,
+    connections: config.savedConnections.map(publicSavedConnection)
+  };
+}
+
+export async function getSavedConnection(connectionId) {
+  const config = await readConnectionConfig();
+  return config.savedConnections.find((connection) => connection.id === connectionId) || null;
+}
+
+export async function activateSavedConnection(connectionId, testedSettings) {
+  const config = await readConnectionConfig();
+  const savedConnection = config.savedConnections.find((connection) => connection.id === connectionId);
+  if (!savedConnection) {
+    const error = new Error('Saved connection was not found.');
+    error.code = 'SAVED_CONNECTION_NOT_FOUND';
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const activeConnection = normalizeSavedConnection({
+    ...savedConnection,
+    ...testedSettings,
+    id: savedConnection.id,
+    name: savedConnection.name
+  });
+  await writeConnectionConfig({
+    activeConnectionId: activeConnection.id,
+    activeConnection,
+    savedConnections: mergeConnections(config.savedConnections, [activeConnection])
+  });
+  return activeConnection;
 }
 
 export function publicConnectionStatus(settings, connected = false, message = '') {

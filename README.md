@@ -148,11 +148,33 @@ GET  /api/customer/:id
 GET  /api/customer/:id/ledger
 GET  /api/customer/:id/invoices
 GET  /api/customer/:id/receipts
+GET  /api/suppliers
 GET  /api/items
 GET  /api/shortages
 GET  /api/expiry
 GET  /api/sales-today
+GET  /api/revenue-details
+GET  /api/trading-profit
+GET  /api/trading-profit-debug
 ```
+
+### Current Report Endpoints
+
+- `GET /api/suppliers`
+  - Returns Almohaseb supplier account summaries.
+- `GET /api/revenue-details`
+  - Revenue Today report.
+  - This is a separate operational revenue/audit report and must not be mixed into Trading & Profit unless Almohaseb itself uses the same official source.
+- `GET /api/trading-profit`
+  - Trading & Profit report.
+  - Official summary source: `The_Profit`.
+  - Summary cards must match the official Almohaseb Trading & Profit screen.
+  - Do not calculate official Trading & Profit totals from `The_Movementrestrictions` / `The_Details`.
+  - Invoice rows shown in the details section are review-only and must not affect official Trading & Profit totals.
+- `GET /api/trading-profit-debug`
+  - Diagnostic endpoint only.
+  - Used for investigation and comparison while matching Almohaseb behavior.
+  - Do not treat it as a production report source.
 
 ## بناء نسخة إنتاجية
 
@@ -169,6 +191,8 @@ Use one official backend/API server:
 
 - Backend/API: `http://0.0.0.0:3001`
 - Frontend/Vite: `http://0.0.0.0:5173`
+- Official backend port: `3001`
+- Official frontend port: `5173`
 - Vite proxies `/api` to `http://127.0.0.1:3001` by default.
 - Do not run the frontend with `API_PORT=3002` except for temporary diagnostics.
 

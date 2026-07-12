@@ -37,7 +37,7 @@ function escapeOdbcValue(value) {
 }
 
 function buildOdbcConnectionString(settings, parsed, nativeClientDriver) {
-  const serverTarget = parsed.instanceName ? settings.server : `${parsed.host},${settings.port || 1433}`;
+  const serverTarget = parsed.instanceName ? parsed.rawServer : `${parsed.host},${settings.port || 1433}`;
   return [
     `Driver={${escapeOdbcValue(nativeClientDriver)}}`,
     `Server=${serverTarget}`,

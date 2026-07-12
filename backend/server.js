@@ -5,6 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { testConnection, executeReadonlyQuery, closePool } from './db.js';
 import {
+  activateSavedConnection,
+  getSavedConnection,
+  getSavedConnections,
   getConnectionSettings,
   publicConnectionStatus,
   saveConnectionSettings
@@ -17,6 +20,9 @@ import {
   inspectTable,
   saveKnowledgeNote
 } from './aiAssistant.js';
+import { processAssistantMessage } from './services/aiAssistant.js';
+import { askSqlAssistant } from './services/sqlAiAssistant.js';
+import { startTelegramBot } from './telegramBot.js';
 
 const app = express();
 const host = process.env.API_HOST || '0.0.0.0';
@@ -52,7 +58,13 @@ function messageFromError(error) {
 app.post(
   '/api/test-connection',
   asyncRoute(async (req, res) => {
-    const settings = await testConnection(req.body);
+    const existingConnection = req.body?.id ? await getSavedConnection(req.body.id) : null;
+    const connectionInput = {
+      ...(existingConnection || {}),
+      ...req.body,
+      password: req.body?.password || existingConnection?.password || ''
+    };
+    const settings = await testConnection(connectionInput);
     res.json({
       success: true,
       message: 'Connected',
@@ -64,14 +76,57 @@ app.post(
 app.post(
   '/api/save-connection',
   asyncRoute(async (req, res) => {
-    const testedSettings = await testConnection(req.body);
-    const savedSettings = await saveConnectionSettings(testedSettings);
+    const existingConnection = req.body?.id ? await getSavedConnection(req.body.id) : null;
+    const connectionInput = {
+      ...(existingConnection || {}),
+      ...req.body,
+      password: req.body?.password || existingConnection?.password || ''
+    };
+    const testedSettings = await testConnection(connectionInput);
+    const savedSettings = await saveConnectionSettings({
+      ...connectionInput,
+      ...testedSettings,
+      id: connectionInput.id,
+      name: connectionInput.name
+    });
     await closePool();
 
     res.json({
       success: true,
       message: 'Saved',
       connection: publicConnectionStatus(savedSettings, true, 'Connected')
+    });
+  })
+);
+
+app.get(
+  '/api/connections',
+  asyncRoute(async (_req, res) => {
+    const result = await getSavedConnections();
+    res.json({
+      success: true,
+      ...result
+    });
+  })
+);
+
+app.post(
+  '/api/connections/:id/use',
+  asyncRoute(async (req, res) => {
+    const savedConnection = await getSavedConnection(req.params.id);
+    if (!savedConnection) {
+      res.status(404).json({ success: false, message: 'Saved connection was not found.' });
+      return;
+    }
+
+    const testedSettings = await testConnection(savedConnection);
+    const activeConnection = await activateSavedConnection(req.params.id, testedSettings);
+    await closePool();
+
+    res.json({
+      success: true,
+      message: 'Connected',
+      connection: publicConnectionStatus(activeConnection, true, 'Connected')
     });
   })
 );
@@ -110,6 +165,17 @@ app.get(
 );
 
 app.post(
+  '/api/chat',
+  asyncRoute(async (req, res) => {
+    const result = await processAssistantMessage(req.body?.message);
+    res.json({
+      success: true,
+      response: result.response
+    });
+  })
+);
+
+app.post(
   '/api/query-readonly',
   asyncRoute(async (req, res) => {
     const result = await executeReadonlyQuery(req.body?.query);
@@ -126,6 +192,14 @@ app.get(
   asyncRoute(async (_req, res) => {
     const context = await getDatabaseContext();
     res.json({ success: true, ...context });
+  })
+);
+
+app.post(
+  '/api/ai/ask',
+  asyncRoute(async (req, res) => {
+    const result = await askSqlAssistant(req.body?.question);
+    res.json({ success: true, ...result });
   })
 );
 
@@ -179,7 +253,7 @@ app.get(
 app.get(
   '/api/supplier/:id/ledger',
   asyncRoute(async (req, res) => {
-    const rows = await almohasebProfile.getSupplierStatement(req.params.id);
+    const rows = await almohasebProfile.getSupplierStatement(req.params.id, req.query || {});
     res.json({ success: true, profile: 'almohaseb', rows });
   })
 );
@@ -219,7 +293,7 @@ app.get(
 app.get(
   '/api/customer/:id/ledger',
   asyncRoute(async (req, res) => {
-    const rows = await almohasebProfile.getCustomerStatement(req.params.id);
+    const rows = await almohasebProfile.getCustomerStatement(req.params.id, req.query || {});
     res.json({ success: true, profile: 'almohaseb', rows });
   })
 );
@@ -241,10 +315,85 @@ app.get(
 );
 
 app.get(
+  '/api/invoices/sales/:movementNo',
+  asyncRoute(async (req, res) => {
+    const invoice = await almohasebProfile.getSalesInvoiceDetails(req.params.movementNo);
+    if (!invoice.header) {
+      res.status(404).json({ success: false, message: 'Invoice not found' });
+      return;
+    }
+    res.json({ success: true, profile: 'almohaseb', ...invoice });
+  })
+);
+
+app.get(
+  '/api/invoices/purchases/:movementNo',
+  asyncRoute(async (req, res) => {
+    const invoice = await almohasebProfile.getPurchaseInvoiceDetails(req.params.movementNo);
+    if (!invoice.header) {
+      res.status(404).json({ success: false, message: 'Invoice not found' });
+      return;
+    }
+    res.json({ success: true, profile: 'almohaseb', ...invoice });
+  })
+);
+
+app.get(
   '/api/items',
   asyncRoute(async (req, res) => {
     const items = await almohasebProfile.getInventory({ search: req.query.search });
     res.json({ success: true, profile: 'almohaseb', items });
+  })
+);
+
+app.get(
+  '/api/items/stock',
+  asyncRoute(async (req, res) => {
+    const rows = await almohasebProfile.getItemStock({
+      search: req.query.search,
+      availableOnly: req.query.availableOnly,
+      sort: req.query.sort,
+      limit: req.query.limit
+    });
+    res.json({ success: true, profile: 'almohaseb', rows });
+  })
+);
+
+app.get(
+  '/api/items/search',
+  asyncRoute(async (req, res) => {
+    const rows = await almohasebProfile.searchItems({ query: req.query.query });
+    res.json({ success: true, profile: 'almohaseb', rows });
+  })
+);
+
+app.get(
+  '/api/items/track',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.trackItem({ itemId: req.query.itemId });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/items/out-of-stock',
+  asyncRoute(async (req, res) => {
+    const rows = await almohasebProfile.getOutOfStockItems({
+      search: req.query.search,
+      sort: req.query.sort
+    });
+    res.json({ success: true, profile: 'almohaseb', rows });
+  })
+);
+
+app.get(
+  '/api/items/expiry',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getItemExpiryReport({
+      search: req.query.search,
+      days: req.query.days
+    });
+    res.json({ success: true, profile: 'almohaseb', ...result });
   })
 );
 
@@ -326,6 +475,158 @@ app.get(
   })
 );
 
+app.get(
+  '/api/analytics/global-search',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsGlobalSearch({ q: req.query.q });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/item-card',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsItemCard({ itemId: req.query.itemId });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/daily-profit',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsDailyProfit(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/smart-shortages',
+  asyncRoute(async (_req, res) => {
+    const result = await almohasebProfile.analyticsSmartShortages();
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/expiry',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsExpiry({ days: req.query.days });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/price-changes',
+  asyncRoute(async (_req, res) => {
+    const result = await almohasebProfile.analyticsPriceChanges();
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/item-profit',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsItemProfit(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/compare-periods',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsComparePeriods(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/users-report',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsUsersReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/goods-capital',
+  asyncRoute(async (_req, res) => {
+    const result = await almohasebProfile.analyticsGoodsCapital();
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/alerts',
+  asyncRoute(async (_req, res) => {
+    const result = await almohasebProfile.analyticsAlerts();
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/manager-dashboard',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsManagerDashboard(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/analytics/item-timeline',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsItemTimeline({ itemId: req.query.itemId });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/reports/purchases',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getPurchasesReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/reports/sales',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getSalesReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/reports/supplier-payments',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getSupplierPaymentsReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/reports/customer-receipts',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getCustomerReceiptsReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/reports/returns',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getReturnsReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/reports/item-movements',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.getItemMovementReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
 const distPath = path.resolve(projectRoot, 'dist');
 if (fs.existsSync(path.join(distPath, 'index.html'))) {
   app.use(express.static(distPath));
@@ -355,4 +656,5 @@ app.use((error, _req, res, _next) => {
 
 app.listen(port, host, () => {
   console.log(`Teryaq SQL Connector API listening on http://${host}:${port} using Almohaseb profile`);
+  startTelegramBot();
 });

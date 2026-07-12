@@ -113,7 +113,7 @@ function QuerySuggestion({ suggestion, onExecute }) {
   );
 }
 
-function MessageBubble({ message, onExecute }) {
+function MessageBubble({ message, onExecute, showSql }) {
   return (
     <article className={`assistant-message is-${message.role}`}>
       <div className="assistant-message-role">
@@ -121,6 +121,49 @@ function MessageBubble({ message, onExecute }) {
         <strong>{message.role === 'assistant' ? 'المساعد' : 'أنت'}</strong>
       </div>
       <MarkdownBlock content={message.content} />
+      {message.keyNumbers?.length ? (
+        <div className="assistant-key-numbers">
+          {message.keyNumbers.map((item, index) => (
+            <div key={`${item.label || index}-${index}`}>
+              <span>{item.label || `قيمة ${index + 1}`}</span>
+              <strong>{item.value ?? '-'}</strong>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {message.data?.length ? <SimpleTable rows={message.data} /> : null}
+      {message.warnings?.length ? (
+        <div className="assistant-warning-list">
+          {message.warnings.map((warning, index) => <p key={index}>{warning}</p>)}
+        </div>
+      ) : null}
+      {message.followups?.length ? (
+        <div className="assistant-followups">
+          {message.followups.map((followup, index) => (
+            <button type="button" key={`${followup}-${index}`} onClick={() => message.onFollowup?.(followup)}>
+              {followup}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {showSql && message.sql ? (
+        <div className="query-suggestion">
+          <div className="query-suggestion-head">
+            <strong>SQL للمدير</strong>
+            <div className="query-actions">
+              <AssistantButton icon={Clipboard} variant="ghost" onClick={() => navigator.clipboard.writeText(message.sql)}>
+                نسخ SQL
+              </AssistantButton>
+              {onExecute ? (
+                <AssistantButton icon={Play} variant="secondary" onClick={() => onExecute(message.sql)}>
+                  تنفيذ
+                </AssistantButton>
+              ) : null}
+            </div>
+          </div>
+          <pre><code>{message.sql}</code></pre>
+        </div>
+      ) : null}
       {message.suggestedQueries?.length ? (
         <div className="query-list">
           {message.suggestedQueries.map((suggestion, index) => (
@@ -289,43 +332,28 @@ function DatabaseExplorer({ context }) {
 }
 
 export default function AiAssistantPage({ onBack }) {
-  const [context, setContext] = useState(null);
-  const [contextLoading, setContextLoading] = useState(true);
-  const [contextError, setContextError] = useState('');
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
       content:
-        '### مساعد Teryaq الداخلي\nاسألني عن أرصدة العملاء، فروقات المبيعات، بنية جداول Almohaseb، أو اطلب SQL للتحقق. كل التنفيذ داخل هذه اللوحة يمر عبر حارس read-only.'
+        '### المساعد الذكي\nاسألني بالعربية عن الإيراد، الأرباح، الأصناف، العملاء، الموردين، أو أي تحليل من بيانات المحاسب. سأقرأ البيانات فقط ولن أعدّل شيئًا.'
     }
   ]);
   const [input, setInput] = useState('');
-  const [expectedValue, setExpectedValue] = useState('');
-  const [actualValue, setActualValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [queryResult, setQueryResult] = useState(null);
   const [queryError, setQueryError] = useState('');
+  const [showSql, setShowSql] = useState(false);
 
-  const loadContext = async () => {
-    setContextLoading(true);
-    setContextError('');
-    try {
-      const data = await api.aiContext();
-      setContext(data);
-    } catch (requestError) {
-      setContextError(requestError.message);
-    } finally {
-      setContextLoading(false);
-    }
-  };
+  const quickQuestions = [
+    'ما إيراد اليوم؟',
+    'ما أرباح اليوم؟',
+    'ما أكثر 20 صنف مبيعاً هذا الشهر؟',
+    'من أكثر الزبائن عليهم دين؟',
+    'ما الموردين الذين علينا لهم أكبر دين؟'
+  ];
 
-  useEffect(() => {
-    loadContext();
-  }, []);
-
-  const sendMessage = async (event) => {
-    event.preventDefault();
-    const text = input.trim();
+  const sendText = async (text) => {
     if (!text || busy) return;
 
     const userMessage = { role: 'user', content: text };
@@ -334,12 +362,20 @@ export default function AiAssistantPage({ onBack }) {
     setBusy(true);
 
     try {
-      const response = await api.aiChat({
-        message: text,
-        expectedValue,
-        actualValue
-      });
-      setMessages((current) => [...current, response.message]);
+      const response = await api.aiAsk({ question: text });
+      setMessages((current) => [
+        ...current,
+        {
+          role: 'assistant',
+          content: response.answer || 'لم أتمكن من تكوين إجابة واضحة.',
+          data: response.data || [],
+          sql: response.sql || '',
+          warnings: response.warnings || [],
+          followups: response.suggestedFollowups || [],
+          keyNumbers: response.keyNumbers || [],
+          onFollowup: sendText
+        }
+      ]);
     } catch (requestError) {
       setMessages((current) => [
         ...current,
@@ -348,6 +384,11 @@ export default function AiAssistantPage({ onBack }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  const sendMessage = async (event) => {
+    event.preventDefault();
+    await sendText(input.trim());
   };
 
   const executeQuery = async (query) => {
@@ -367,61 +408,52 @@ export default function AiAssistantPage({ onBack }) {
       <header className="dashboard-header">
         <div>
           <p className="eyebrow">Teryaq SQL Connector</p>
-          <h1>المساعد الذكي الداخلي</h1>
+          <h1>المساعد الذكي</h1>
         </div>
         <div className="header-actions">
-          <AssistantButton icon={RefreshCcw} variant="ghost" onClick={loadContext}>تحديث السياق</AssistantButton>
           <AssistantButton icon={ArrowRight} variant="ghost" onClick={onBack}>رجوع</AssistantButton>
         </div>
       </header>
 
-      {contextError ? (
-        <div className="soft-state is-error"><AlertTriangle size={20} />{contextError}</div>
-      ) : null}
-
-      <div className="assistant-layout">
-        <ContextPanel
-          context={context}
-          loading={contextLoading}
-          onKnowledgeSaved={(knowledge) => setContext((current) => ({ ...current, knowledge }))}
-        />
-
+      <div className="assistant-layout assistant-chat-layout">
         <section className="assistant-main">
           <section className="assistant-panel chat-panel">
             <div className="assistant-section-head">
               <div>
-                <h3>Investigation chat</h3>
-                <p>اكتب سؤالًا أو أدخل قيمة متوقعة/فعلية للمقارنة.</p>
+                <h3>اسأل بيانات الصيدلية</h3>
+                <p>الإجابة تأتي من SQL Server عبر الباكند فقط وبوضع قراءة فقط.</p>
               </div>
               <Bot size={24} />
             </div>
 
-            <div className="comparison-row">
-              <label>
-                <span>Expected</span>
-                <input value={expectedValue} onChange={(event) => setExpectedValue(event.target.value)} placeholder="392.500" />
-              </label>
-              <label>
-                <span>Actual</span>
-                <input value={actualValue} onChange={(event) => setActualValue(event.target.value)} placeholder="القيمة الظاهرة" />
-              </label>
+            <div className="assistant-quick-questions">
+              {quickQuestions.map((question) => (
+                <button type="button" key={question} onClick={() => sendText(question)} disabled={busy}>
+                  {question}
+                </button>
+              ))}
             </div>
+
+            <label className="assistant-sql-toggle">
+              <input type="checkbox" checked={showSql} onChange={(event) => setShowSql(event.target.checked)} />
+              <span>إظهار SQL للمدير</span>
+            </label>
 
             <div className="conversation">
               {messages.map((message, index) => (
-                <MessageBubble key={index} message={message} onExecute={executeQuery} />
+                <MessageBubble key={index} message={message} onExecute={executeQuery} showSql={showSql} />
               ))}
-              {busy ? <div className="soft-state"><RefreshCcw size={20} />جاري التحليل</div> : null}
+              {busy ? <div className="soft-state"><RefreshCcw size={20} />جاري تحليل السؤال</div> : null}
             </div>
 
             <form className="assistant-input" onSubmit={sendMessage}>
               <textarea
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
-                placeholder="مثال: Why is customer balance different for Person_No 270?"
-                rows={4}
+                placeholder="مثال: حلل صنف Panadol Advance أو ما أرباح يوم 24/06/2026؟"
+                rows={3}
               />
-              <AssistantButton icon={Send} type="submit" disabled={busy}>إرسال</AssistantButton>
+              <AssistantButton icon={Send} type="submit" disabled={busy || !input.trim()}>إرسال</AssistantButton>
             </form>
           </section>
 
@@ -437,8 +469,6 @@ export default function AiAssistantPage({ onBack }) {
             {queryResult?.loading ? <div className="soft-state"><RefreshCcw size={20} />جاري التنفيذ</div> : null}
             {queryResult && !queryResult.loading ? <SimpleTable rows={queryResult.rows} /> : null}
           </section>
-
-          <DatabaseExplorer context={context} />
         </section>
       </div>
     </main>

@@ -1,8 +1,13 @@
-const forbiddenPattern = /\b(insert|update|delete|drop|alter|truncate|exec|execute|merge)\b/i;
+const forbiddenPattern =
+  /\b(insert|update|delete|drop|alter|truncate|exec|execute|merge|create|grant|revoke|into|openrowset|opendatasource)\b|(^|[^a-z0-9_])(xp_|sp_)/i;
 
 function hasMultipleStatements(query) {
   const withoutTrailingSemicolon = query.replace(/;\s*$/, '');
   return withoutTrailingSemicolon.includes(';');
+}
+
+function hasSqlComments(query) {
+  return /--|\/\*/.test(query);
 }
 
 export function validateReadonlyQuery(query) {
@@ -24,6 +29,13 @@ export function validateReadonlyQuery(query) {
 
   if (forbiddenPattern.test(trimmed)) {
     const error = new Error('Query contains a forbidden SQL command.');
+    error.code = 'READONLY_VIOLATION';
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (hasSqlComments(trimmed)) {
+    const error = new Error('SQL comments are not allowed in read-only mode.');
     error.code = 'READONLY_VIOLATION';
     error.statusCode = 400;
     throw error;
