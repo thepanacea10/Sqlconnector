@@ -23,6 +23,7 @@ import {
 import { processAssistantMessage } from './services/aiAssistant.js';
 import { askSqlAssistant } from './services/sqlAiAssistant.js';
 import { startTelegramBot } from './telegramBot.js';
+import stockcountRoutes from './routes/stockcountRoutes.js';
 
 const app = express();
 const host = process.env.API_HOST || '0.0.0.0';
@@ -32,6 +33,7 @@ const appVersion = packageInfo.version || '0.0.0';
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+app.use('/api/v1/stockcount', stockcountRoutes);
 
 function backendRuntimeStatus() {
   return {
