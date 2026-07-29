@@ -43,6 +43,19 @@ const itemBaseFrom = `
   ) price ON price.Item_No = i.Item_No
   OUTER APPLY (
     SELECT TOP (1)
+      CASE
+        WHEN d.Item_Cost IS NOT NULL AND d.Item_Cost > 0 THEN d.Item_Cost
+        WHEN ABS(ISNULL(d.Item_Quntity, 0)) > 0 THEN ISNULL(d.Charge_Value, 0) / ABS(d.Item_Quntity)
+        ELSE NULL
+      END AS lastPurchasePrice
+    FROM dbo.The_Details d
+    INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
+    WHERE d.Item_No = i.Item_No
+      AND mr.Account_No = 7
+    ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC, d.Details_No DESC
+  ) lastPurchase
+  OUTER APPLY (
+    SELECT TOP (1)
       idt.Exp_date AS expiryDate
     FROM dbo.The_ItemDetails idt
     WHERE idt.Item_No = i.Item_No
@@ -61,6 +74,7 @@ const itemSelect = `
   ISNULL(stock.availableQuantity, 0) AS rawQuantity,
   unitInfo.Unit_OldQuantity AS packSize,
   price.Charge_Value AS sellingPrice,
+  lastPurchase.lastPurchasePrice AS lastPurchasePrice,
   batchInfo.expiryDate AS expiryDate
 `;
 
@@ -106,6 +120,7 @@ function mapStockcountItem(row, readAt) {
   const rawQuantity = Number(row.rawQuantity || 0);
   const packSize = toNumberOrNull(row.packSize);
   const sellingPrice = toNumberOrNull(row.sellingPrice);
+  const lastPurchasePrice = toNumberOrNull(row.lastPurchasePrice);
   const base = {
     itemId: String(row.itemId),
     itemName: row.itemName === null || row.itemName === undefined ? '' : String(row.itemName),
@@ -116,6 +131,7 @@ function mapStockcountItem(row, readAt) {
     systemUnits: null,
     formattedQuantity: null,
     sellingPrice,
+    lastPurchasePrice,
     expiryDate: row.expiryDate || null,
     conversionStatus: 'ok',
     readAt
