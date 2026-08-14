@@ -380,11 +380,11 @@ app.get(
 app.get(
   '/api/items/out-of-stock',
   asyncRoute(async (req, res) => {
-    const rows = await almohasebProfile.getOutOfStockItems({
+    const result = await almohasebProfile.getOutOfStockItems({
       search: req.query.search,
       sort: req.query.sort
     });
-    res.json({ success: true, profile: 'almohaseb', rows });
+    res.json({ success: true, profile: 'almohaseb', ...result });
   })
 );
 
@@ -393,7 +393,8 @@ app.get(
   asyncRoute(async (req, res) => {
     const result = await almohasebProfile.getItemExpiryReport({
       search: req.query.search,
-      days: req.query.days
+      days: req.query.days,
+      bucket: req.query.bucket
     });
     res.json({ success: true, profile: 'almohaseb', ...result });
   })

@@ -1452,19 +1452,7 @@ export async function getItemStock({ search, availableOnly, sort, limit } = {}) 
 
 export async function getOutOfStockItems({ search, sort } = {}) {
   const term = searchText(search);
-  const query = `
-    SELECT TOP (500)
-      i.Item_No AS itemCode,
-      i.Item_No AS itemId,
-      COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
-      barcode.Barcode AS barcode,
-      ISNULL(stock.availableQuantity, 0) AS currentQuantity,
-      unitInfo.Unit_OldQuantity AS packSize,
-      stock.cost AS purchasePrice,
-      price.Charge_Value AS salePrice,
-      lastSale.lastSaleDate,
-      lastPurchase.lastPurchaseDate,
-      lastPurchase.lastSupplier
+  const fromClause = `
     FROM dbo.The_Items i
     ${itemJoins}
     OUTER APPLY (
@@ -1485,7 +1473,8 @@ export async function getOutOfStockItems({ search, sort } = {}) {
         AND mr.Account_No = 7
       ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC
     ) lastPurchase
-    WHERE ISNULL(stock.availableQuantity, 0) <= 0
+    WHERE ISNULL(i.Item_Status, 0) = 0
+      AND ISNULL(stock.availableQuantity, 0) <= 0
       AND (
         @search = N''
         OR CONVERT(NVARCHAR(4000), i.Scientific_Name) LIKE @searchLike
@@ -1493,18 +1482,81 @@ export async function getOutOfStockItems({ search, sort } = {}) {
         OR CONVERT(NVARCHAR(4000), barcode.Barcode) LIKE @searchLike
         OR CONVERT(NVARCHAR(50), i.Item_No) LIKE @searchLike
       )
+  `;
+  const rowsQuery = `
+    SELECT
+      i.Item_No AS itemCode,
+      i.Item_No AS itemId,
+      COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
+      barcode.Barcode AS barcode,
+      ISNULL(stock.availableQuantity, 0) AS currentQuantity,
+      unitInfo.Unit_OldQuantity AS packSize,
+      stock.cost AS purchasePrice,
+      price.Charge_Value AS salePrice,
+      lastSale.lastSaleDate,
+      lastPurchase.lastPurchaseDate,
+      lastPurchase.lastSupplier
+    ${fromClause}
     ORDER BY ${sort === 'quantity' ? 'ISNULL(stock.availableQuantity, 0) ASC, itemName ASC' : 'itemName ASC'}
   `;
+  const countQuery = `
+    SELECT COUNT(1) AS totalCount
+    ${fromClause}
+  `;
 
-  const result = await executeReadonlyQuery(query, (request) => bindItemSearch(request, term));
-  return withFormattedStockQuantity(result.recordset || []);
+  const [rowsResult, countResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, (request) => bindItemSearch(request, term)),
+    executeReadonlyQuery(countQuery, (request) => bindItemSearch(request, term))
+  ]);
+  return {
+    rows: withFormattedStockQuantity(rowsResult.recordset || []),
+    totalCount: Number(countResult.recordset?.[0]?.totalCount || 0)
+  };
 }
 
-export async function getItemExpiryReport({ search, days } = {}) {
+function expiryBucketFilter(bucket) {
+  const normalized = String(bucket || '').toLowerCase();
+  const today = 'DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0)';
+  if (normalized === 'expired') {
+    return {
+      bucket: 'expired',
+      filter: `AND idt.Exp_date < ${today}`
+    };
+  }
+  if (normalized === '0-30' || normalized === '30') {
+    return {
+      bucket: '0-30',
+      filter: `AND idt.Exp_date >= ${today}
+      AND idt.Exp_date < DATEADD(DAY, 31, ${today})`
+    };
+  }
+  if (normalized === '31-60') {
+    return {
+      bucket: '31-60',
+      filter: `AND idt.Exp_date >= DATEADD(DAY, 31, ${today})
+      AND idt.Exp_date < DATEADD(DAY, 61, ${today})`
+    };
+  }
+  if (normalized === '61-90') {
+    return {
+      bucket: '61-90',
+      filter: `AND idt.Exp_date >= DATEADD(DAY, 61, ${today})
+      AND idt.Exp_date < DATEADD(DAY, 91, ${today})`
+    };
+  }
+  return null;
+}
+
+export async function getItemExpiryReport({ search, days, bucket } = {}) {
   const term = searchText(search);
   const safeDays = parseDays(days || 90);
+  const bucketConfig = expiryBucketFilter(bucket);
+  const dateFilter = bucketConfig
+    ? bucketConfig.filter
+    : `AND idt.Exp_date >= DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0)
+      AND idt.Exp_date < DATEADD(DAY, @days + 1, DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0))`;
   const query = `
-    SELECT TOP (500)
+    SELECT
       i.Item_No AS itemCode,
       i.Item_No AS itemId,
       COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
@@ -1543,8 +1595,7 @@ export async function getItemExpiryReport({ search, days } = {}) {
       WHERE c.ItemDetails_No = idt.ItemDetails_No
     ) price
     WHERE idt.Exp_date IS NOT NULL
-      AND idt.Exp_date >= DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0)
-      AND idt.Exp_date < DATEADD(DAY, @days + 1, DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0))
+      ${dateFilter}
       AND ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0) > 0
       AND (
         @search = N''
@@ -1558,9 +1609,13 @@ export async function getItemExpiryReport({ search, days } = {}) {
 
   const result = await executeReadonlyQuery(query, (request) => {
     bindItemSearch(request, term);
-    request.input('days', sql.Int, safeDays);
+    if (!bucketConfig) request.input('days', sql.Int, safeDays);
   });
-  return { days: safeDays, rows: withFormattedStockQuantity(result.recordset || [], 'quantity') };
+  return {
+    days: bucketConfig ? null : safeDays,
+    bucket: bucketConfig?.bucket || null,
+    rows: withFormattedStockQuantity(result.recordset || [], 'quantity')
+  };
 }
 
 export async function searchItems({ query } = {}) {
@@ -1627,14 +1682,43 @@ export async function trackItem({ itemId }) {
       mr.Movementrestrictions_No AS movementNo,
       mr.Purchase_invoice AS invoiceNo,
       ISNULL(person.Person_Name, N'غير محدد') AS personName,
+      ISNULL(d.Item_Quntity, 0) AS rawQuantity,
+      unitInfo.Unit_Type AS unitName,
+      unitInfo.Unit_OldQuantity AS unitOldQuantity,
       CASE
+        WHEN mr.Account_No IN (7, 8)
+          AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0
+        THEN ABS(ISNULL(d.Item_Quntity, 0)) / unitInfo.Unit_OldQuantity
+        ELSE NULL
+      END AS businessQuantity,
+      CASE
+        WHEN mr.Account_No IN (7, 8)
+          AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0
+        THEN ISNULL(d.Charge_Value, 0)
+        ELSE NULL
+      END AS businessUnitPrice,
+      CASE
+        WHEN mr.Account_No = 7
+          AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0 THEN ABS(ISNULL(d.Item_Quntity, 0)) / unitInfo.Unit_OldQuantity
+        WHEN mr.Account_No = 8
+          AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0 THEN -ABS(ISNULL(d.Item_Quntity, 0)) / unitInfo.Unit_OldQuantity
         WHEN mr.Account_No IN (1, 3, 8) THEN -ISNULL(d.Item_Quntity, 0)
         WHEN mr.Account_No IN (2, 4) THEN -ISNULL(d.Item_Quntity, 0)
         WHEN mr.Account_No IN (7) THEN ISNULL(d.Item_Quntity, 0)
         ELSE ISNULL(d.Item_Quntity, 0) * ISNULL(acc.Account_kind, 1)
       END AS quantity,
-      CASE WHEN ISNULL(d.Item_Quntity, 0) = 0 THEN ISNULL(d.Charge_Value, 0) ELSE ISNULL(d.Charge_Value, 0) / ABS(ISNULL(d.Item_Quntity, 1)) END AS price,
-      ISNULL(d.Charge_Value, 0) AS total,
+      CASE
+        WHEN mr.Account_No IN (7, 8)
+          AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0 THEN ISNULL(d.Charge_Value, 0)
+        WHEN ISNULL(d.Item_Quntity, 0) = 0 THEN ISNULL(d.Charge_Value, 0)
+        ELSE ISNULL(d.Charge_Value, 0) / ABS(ISNULL(d.Item_Quntity, 1))
+      END AS price,
+      CASE
+        WHEN mr.Account_No IN (7, 8)
+          AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0
+        THEN (ABS(ISNULL(d.Item_Quntity, 0)) / unitInfo.Unit_OldQuantity) * ISNULL(d.Charge_Value, 0)
+        ELSE ISNULL(d.Charge_Value, 0)
+      END AS total,
       d.Item_Cost AS itemCost,
       CASE
         WHEN mr.Account_No IN (7, 8) THEN N'purchase'
@@ -1645,6 +1729,21 @@ export async function trackItem({ itemId }) {
     INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
     LEFT JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
     LEFT JOIN dbo.The_Persons person ON person.Person_No = mr.Person_No
+    OUTER APPLY (
+      SELECT TOP (1)
+        COALESCE(NULLIF(barcodeUnit.Unit_OldQuantity, 0), NULLIF(defaultUnit.Unit_OldQuantity, 0), 1) AS Unit_OldQuantity,
+        ISNULL(COALESCE(barcodeUnit.Unit_Type, defaultUnit.Unit_Type), N'') AS Unit_Type
+      FROM (SELECT 1 AS oneRow) seed
+      LEFT JOIN dbo.The_Barcode barcodeInfo
+        ON barcodeInfo.Item_No = d.Item_No
+        AND CONVERT(NVARCHAR(200), barcodeInfo.Barcode) = CONVERT(NVARCHAR(200), d.Barcode)
+      LEFT JOIN dbo.The_Units barcodeUnit
+        ON barcodeUnit.Item_No = d.Item_No
+        AND barcodeUnit.Unit_No = barcodeInfo.Unit_No
+      LEFT JOIN dbo.The_Units defaultUnit
+        ON defaultUnit.Item_No = d.Item_No
+        AND defaultUnit.Default_Unit = 1
+    ) unitInfo
     WHERE d.Item_No = @itemNo
     ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC
   `;
@@ -2805,9 +2904,9 @@ export async function analyticsDailyProfit(filters = {}) {
 }
 
 export async function analyticsSmartShortages() {
-  const rows = await getOutOfStockItems({ search: '', sort: 'name' });
+  const result = await getOutOfStockItems({ search: '', sort: 'name' });
   return {
-    rows: rows.map((row) => ({
+    rows: (result.rows || []).map((row) => ({
       ...row,
       outOfStockSince: row.lastSaleDate || null,
       averageSalesPerMonth: null,
