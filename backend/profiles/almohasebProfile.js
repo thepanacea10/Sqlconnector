@@ -2927,63 +2927,257 @@ export async function analyticsExpiry({ days } = {}) {
   };
 }
 
-export async function analyticsPriceChanges() {
-  const query = `
-    SELECT TOP (200)
-      latest.Item_No AS itemId,
-      COALESCE(tradeName.Trade_Name, item.Scientific_Name) AS itemName,
-      barcode.Barcode AS barcode,
-      previous.purchasePrice AS previousPurchasePrice,
-      latest.purchasePrice AS latestPurchasePrice,
-      latest.purchasePrice - previous.purchasePrice AS difference,
-      CASE WHEN previous.purchasePrice = 0 THEN NULL ELSE ((latest.purchasePrice - previous.purchasePrice) / previous.purchasePrice) * 100 END AS percentChange,
-      previous.purchaseDate AS previousPriceDate,
-      latest.purchaseDate AS latestPriceDate,
-      latest.supplierName
+function priceChangePage(filters = {}) {
+  const page = Math.max(1, parseSafeInteger(filters.page, 1) || 1);
+  const rawPageSize = parseSafeInteger(filters.pageSize, 50) || 50;
+  const pageSize = Math.min(100, Math.max(1, rawPageSize));
+  return { page, pageSize, fromRow: ((page - 1) * pageSize) + 1, toRow: page * pageSize };
+}
+
+function parseSafeInteger(value, fallback) {
+  const number = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function priceChangeStatusFilter(status) {
+  const normalized = String(status || 'valid').toLowerCase();
+  if (normalized === 'all') return { status: 'all', sql: '1 = 1' };
+  if (normalized === 'review') return { status: 'review', sql: "pairs.status <> 'valid'" };
+  if (['valid', 'unit_mismatch_risk', 'opening_balance_risk', 'data_anomaly'].includes(normalized)) {
+    return { status: normalized, sql: `pairs.status = '${normalized}'` };
+  }
+  return { status: 'valid', sql: "pairs.status = 'valid'" };
+}
+
+function priceChangeSort(sort) {
+  switch (String(sort || 'latest').toLowerCase()) {
+    case 'largest-increase':
+      return { sort: 'largest-increase', sql: 'pairs.difference DESC, pairs.latestPriceDate DESC, pairs.latestMovementNo DESC' };
+    case 'largest-decrease':
+      return { sort: 'largest-decrease', sql: 'pairs.difference ASC, pairs.latestPriceDate DESC, pairs.latestMovementNo DESC' };
+    case 'largest-change':
+      return { sort: 'largest-change', sql: 'ABS(pairs.difference) DESC, pairs.latestPriceDate DESC, pairs.latestMovementNo DESC' };
+    default:
+      return { sort: 'latest', sql: 'pairs.latestPriceDate DESC, pairs.latestMovementNo DESC, pairs.itemName ASC' };
+  }
+}
+
+function purchasePriceEventsSubquery() {
+  return `
+    SELECT
+      events.*,
+      ROW_NUMBER() OVER (PARTITION BY events.Item_No ORDER BY events.purchaseDate DESC, events.Movementrestrictions_No DESC, events.Details_No DESC) AS rn
     FROM (
       SELECT
-        d.Item_No,
-        d.Item_Cost AS purchasePrice,
-        mr.Movementrestrictions_Date AS purchaseDate,
-        mr.Movementrestrictions_No,
-        supplier.Person_Name AS supplierName,
-        ROW_NUMBER() OVER (PARTITION BY d.Item_No ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC, d.Details_No DESC) AS rn
-      FROM dbo.The_Details d
-      INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
-      LEFT JOIN dbo.The_Persons supplier ON supplier.Person_No = mr.Person_No
-      WHERE mr.Account_No = 7
-        AND d.Item_Cost IS NOT NULL
-    ) latest
-    INNER JOIN (
-      SELECT
-        d.Item_No,
-        d.Item_Cost AS purchasePrice,
-        mr.Movementrestrictions_Date AS purchaseDate,
-        ROW_NUMBER() OVER (PARTITION BY d.Item_No ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC, d.Details_No DESC) AS rn
-      FROM dbo.The_Details d
-      INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
-      WHERE mr.Account_No = 7
-        AND d.Item_Cost IS NOT NULL
-    ) previous ON previous.Item_No = latest.Item_No AND previous.rn = 2
-    LEFT JOIN dbo.The_Items item ON item.Item_No = latest.Item_No
-    OUTER APPLY (
-      SELECT TOP (1) t.Trade_Name
-      FROM dbo.The_Trade t
-      WHERE t.Item_No = latest.Item_No
-      ORDER BY t.Trade_No ASC
-    ) tradeName
-    OUTER APPLY (
-      SELECT TOP (1) b.Barcode
-      FROM dbo.The_Barcode b
-      WHERE b.Item_No = latest.Item_No
-      ORDER BY b.Bar_No ASC
-    ) barcode
-    WHERE latest.rn = 1
-      AND ISNULL(latest.purchasePrice, 0) <> ISNULL(previous.purchasePrice, 0)
-    ORDER BY ABS(latest.purchasePrice - previous.purchasePrice) DESC
+        detailRows.*,
+        CASE
+          WHEN detailRows.supplierName LIKE N'%بعد الجرد%' THEN 'opening_balance_risk'
+          WHEN detailRows.detailLineCount > 1 THEN 'data_anomaly'
+          WHEN ISNULL(detailRows.Item_Quntity, 0) <= 0 THEN 'data_anomaly'
+          WHEN ISNULL(detailRows.Charge_Value, 0) <= 0 THEN 'data_anomaly'
+          WHEN detailRows.detailBarcode <> N'' AND detailRows.barcodeResolved = 0 THEN 'data_anomaly'
+          WHEN detailRows.Quantity_Received IS NOT NULL AND ABS(ISNULL(detailRows.Quantity_Received, 0) - ISNULL(detailRows.Item_Quntity, 0)) > 0.001 THEN 'data_anomaly'
+          WHEN ISNULL(detailRows.unitOldQuantity, 0) <= 0 OR ISNULL(detailRows.unitName, N'') = N'' THEN 'unit_mismatch_risk'
+          ELSE 'valid'
+        END AS eventStatus,
+        CASE
+          WHEN detailRows.supplierName LIKE N'%بعد الجرد%' THEN 'opening_balance_or_after_inventory_supplier'
+          WHEN detailRows.detailLineCount > 1 THEN 'multiple_item_lines_in_same_movement'
+          WHEN ISNULL(detailRows.Item_Quntity, 0) <= 0 THEN 'non_positive_quantity'
+          WHEN ISNULL(detailRows.Charge_Value, 0) <= 0 THEN 'non_positive_purchase_price'
+          WHEN detailRows.detailBarcode <> N'' AND detailRows.barcodeResolved = 0 THEN 'unresolved_purchase_barcode'
+          WHEN detailRows.Quantity_Received IS NOT NULL AND ABS(ISNULL(detailRows.Quantity_Received, 0) - ISNULL(detailRows.Item_Quntity, 0)) > 0.001 THEN 'quantity_received_differs_from_item_quantity'
+          WHEN ISNULL(detailRows.unitOldQuantity, 0) <= 0 OR ISNULL(detailRows.unitName, N'') = N'' THEN 'unresolved_purchase_unit'
+          ELSE 'comparable_purchase_row'
+        END AS eventStatusReason
+      FROM (
+        SELECT *
+        FROM (
+          SELECT
+            d.Item_No,
+            d.Details_No,
+            d.Movementrestrictions_No,
+            mr.Purchase_invoice,
+            mr.Movementrestrictions_Date AS purchaseDate,
+            mr.Case_Invoice,
+            mr.Person_No AS supplierId,
+            ISNULL(supplier.Person_Name, N'غير محدد') AS supplierName,
+            COALESCE(tradeName.Trade_Name, item.Scientific_Name) AS itemName,
+            primaryBarcode.Barcode AS primaryBarcode,
+            ISNULL(CONVERT(NVARCHAR(200), d.Barcode), N'') AS detailBarcode,
+            CASE WHEN barcodeInfo.Bar_No IS NULL THEN 0 ELSE 1 END AS barcodeResolved,
+            ISNULL(COALESCE(barcodeUnit.Unit_Type, defaultUnit.Unit_Type), N'') AS unitName,
+            COALESCE(NULLIF(barcodeUnit.Unit_OldQuantity, 0), NULLIF(defaultUnit.Unit_OldQuantity, 0), 0) AS unitOldQuantity,
+            d.Item_Quntity,
+            d.Quantity_Received,
+            d.Charge_Value,
+            d.Item_Cost,
+            ABS(ISNULL(d.Item_Quntity, 0)) AS rawQuantity,
+            CASE
+              WHEN COALESCE(NULLIF(barcodeUnit.Unit_OldQuantity, 0), NULLIF(defaultUnit.Unit_OldQuantity, 0), 0) > 0
+              THEN ABS(ISNULL(d.Item_Quntity, 0)) / COALESCE(NULLIF(barcodeUnit.Unit_OldQuantity, 0), NULLIF(defaultUnit.Unit_OldQuantity, 0), 1)
+              ELSE NULL
+            END AS businessQuantity,
+            ISNULL(d.Charge_Value, 0) AS businessPurchasePrice,
+            CASE
+              WHEN COALESCE(NULLIF(barcodeUnit.Unit_OldQuantity, 0), NULLIF(defaultUnit.Unit_OldQuantity, 0), 0) > 0
+              THEN (ABS(ISNULL(d.Item_Quntity, 0)) / COALESCE(NULLIF(barcodeUnit.Unit_OldQuantity, 0), NULLIF(defaultUnit.Unit_OldQuantity, 0), 1)) * ISNULL(d.Charge_Value, 0)
+              ELSE NULL
+            END AS businessLineTotal,
+            COUNT(*) OVER (PARTITION BY d.Item_No, d.Movementrestrictions_No) AS detailLineCount,
+            ROW_NUMBER() OVER (PARTITION BY d.Item_No, d.Movementrestrictions_No ORDER BY d.Details_No DESC) AS lineRankInMovement
+          FROM dbo.The_Details d
+          INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
+          LEFT JOIN dbo.The_Persons supplier ON supplier.Person_No = mr.Person_No
+          LEFT JOIN dbo.The_Items item ON item.Item_No = d.Item_No
+          OUTER APPLY (
+            SELECT TOP (1) t.Trade_Name
+            FROM dbo.The_Trade t
+            WHERE t.Item_No = d.Item_No
+            ORDER BY t.Trade_No ASC
+          ) tradeName
+          OUTER APPLY (
+            SELECT TOP (1) b.Barcode
+            FROM dbo.The_Barcode b
+            WHERE b.Item_No = d.Item_No
+            ORDER BY b.Bar_No ASC
+          ) primaryBarcode
+          LEFT JOIN dbo.The_Barcode barcodeInfo
+            ON barcodeInfo.Item_No = d.Item_No
+            AND CONVERT(NVARCHAR(200), barcodeInfo.Barcode) = CONVERT(NVARCHAR(200), d.Barcode)
+          LEFT JOIN dbo.The_Units barcodeUnit
+            ON barcodeUnit.Item_No = d.Item_No
+            AND barcodeUnit.Unit_No = barcodeInfo.Unit_No
+          LEFT JOIN dbo.The_Units defaultUnit
+            ON defaultUnit.Item_No = d.Item_No
+            AND defaultUnit.Default_Unit = 1
+          WHERE mr.Account_No = 7
+            AND d.Item_Cost IS NOT NULL
+        ) rankedLines
+        WHERE rankedLines.lineRankInMovement = 1
+      ) detailRows
+    ) events
   `;
-  const result = await executeReadonlyQuery(query);
-  return { rows: result.recordset || [] };
+}
+
+function priceChangePairsSubquery() {
+  const events = purchasePriceEventsSubquery();
+  return `
+    SELECT
+      latest.Item_No AS itemId,
+      latest.itemName,
+      latest.primaryBarcode AS barcode,
+      previous.businessPurchasePrice AS previousPurchasePrice,
+      latest.businessPurchasePrice AS latestPurchasePrice,
+      latest.businessPurchasePrice - previous.businessPurchasePrice AS difference,
+      CASE WHEN previous.businessPurchasePrice = 0 THEN NULL ELSE ((latest.businessPurchasePrice - previous.businessPurchasePrice) / previous.businessPurchasePrice) * 100 END AS percentChange,
+      previous.purchaseDate AS previousPriceDate,
+      latest.purchaseDate AS latestPriceDate,
+      previous.purchaseDate AS previousDate,
+      latest.purchaseDate AS latestDate,
+      previous.Movementrestrictions_No AS previousMovementNo,
+      latest.Movementrestrictions_No AS latestMovementNo,
+      previous.Purchase_invoice AS previousInvoiceNo,
+      latest.Purchase_invoice AS latestInvoiceNo,
+      previous.Case_Invoice AS previousCaseInvoice,
+      latest.Case_Invoice AS latestCaseInvoice,
+      previous.supplierId AS previousSupplierId,
+      previous.supplierName AS previousSupplierName,
+      latest.supplierId AS latestSupplierId,
+      latest.supplierName AS latestSupplierName,
+      latest.supplierName AS supplierName,
+      previous.detailBarcode AS previousBarcode,
+      latest.detailBarcode AS latestBarcode,
+      latest.unitName AS unitName,
+      previous.unitName AS previousUnitName,
+      latest.unitName AS latestUnitName,
+      previous.unitOldQuantity AS previousUnitOldQuantity,
+      latest.unitOldQuantity AS latestUnitOldQuantity,
+      previous.rawQuantity AS previousRawQuantity,
+      latest.rawQuantity AS latestRawQuantity,
+      previous.businessQuantity AS previousBusinessQuantity,
+      latest.businessQuantity AS latestBusinessQuantity,
+      previous.Item_Cost AS previousItemCost,
+      latest.Item_Cost AS latestItemCost,
+      previous.businessLineTotal AS previousLineTotal,
+      latest.businessLineTotal AS latestLineTotal,
+      previous.eventStatus AS previousEventStatus,
+      latest.eventStatus AS latestEventStatus,
+      previous.eventStatusReason AS previousStatusReason,
+      latest.eventStatusReason AS latestStatusReason,
+      previous.detailLineCount AS previousDetailLineCount,
+      latest.detailLineCount AS latestDetailLineCount,
+      CASE
+        WHEN latest.eventStatus = 'opening_balance_risk' OR previous.eventStatus = 'opening_balance_risk' THEN 'opening_balance_risk'
+        WHEN latest.eventStatus = 'data_anomaly' OR previous.eventStatus = 'data_anomaly' THEN 'data_anomaly'
+        WHEN latest.eventStatus = 'unit_mismatch_risk' OR previous.eventStatus = 'unit_mismatch_risk' THEN 'unit_mismatch_risk'
+        WHEN ISNULL(latest.unitName, N'') <> ISNULL(previous.unitName, N'')
+          OR ISNULL(latest.unitOldQuantity, 0) <> ISNULL(previous.unitOldQuantity, 0) THEN 'unit_mismatch_risk'
+        ELSE 'valid'
+      END AS status,
+      CASE
+        WHEN latest.eventStatus = 'opening_balance_risk' OR previous.eventStatus = 'opening_balance_risk' THEN 'one_purchase_row_looks_like_opening_balance'
+        WHEN latest.eventStatus = 'data_anomaly' OR previous.eventStatus = 'data_anomaly' THEN latest.eventStatusReason + ' | ' + previous.eventStatusReason
+        WHEN latest.eventStatus = 'unit_mismatch_risk' OR previous.eventStatus = 'unit_mismatch_risk' THEN latest.eventStatusReason + ' | ' + previous.eventStatusReason
+        WHEN ISNULL(latest.unitName, N'') <> ISNULL(previous.unitName, N'')
+          OR ISNULL(latest.unitOldQuantity, 0) <> ISNULL(previous.unitOldQuantity, 0) THEN 'purchase_units_are_not_equivalent'
+        ELSE 'same_purchase_unit'
+      END AS statusReason
+    FROM (${events}) latest
+    INNER JOIN (${events}) previous ON previous.Item_No = latest.Item_No AND previous.rn = 2
+    WHERE latest.rn = 1
+      AND ISNULL(latest.businessPurchasePrice, 0) <> ISNULL(previous.businessPurchasePrice, 0)
+  `;
+}
+
+export async function analyticsPriceChanges(filters = {}) {
+  const paging = priceChangePage(filters);
+  const statusFilter = priceChangeStatusFilter(filters.status);
+  const sort = priceChangeSort(filters.sort);
+  const pairs = priceChangePairsSubquery();
+  const rowsQuery = `
+    SELECT *
+    FROM (
+      SELECT
+        ROW_NUMBER() OVER (ORDER BY ${sort.sql}) AS rowNumber,
+        pairs.*
+      FROM (${pairs}) pairs
+      WHERE ${statusFilter.sql}
+    ) paged
+    WHERE paged.rowNumber BETWEEN ${paging.fromRow} AND ${paging.toRow}
+    ORDER BY paged.rowNumber ASC
+  `;
+  const countQuery = `
+    SELECT COUNT(*) AS totalCount
+    FROM (${pairs}) pairs
+    WHERE ${statusFilter.sql}
+  `;
+  const summaryQuery = `
+    SELECT
+      COUNT(*) AS totalCandidateItems,
+      SUM(CASE WHEN pairs.status = 'valid' THEN 1 ELSE 0 END) AS trustedValidChanges,
+      SUM(CASE WHEN pairs.status <> 'valid' THEN 1 ELSE 0 END) AS reviewRows,
+      SUM(CASE WHEN pairs.status = 'unit_mismatch_risk' THEN 1 ELSE 0 END) AS unitMismatchRisk,
+      SUM(CASE WHEN pairs.status = 'opening_balance_risk' THEN 1 ELSE 0 END) AS openingBalanceRisk,
+      SUM(CASE WHEN pairs.status = 'data_anomaly' THEN 1 ELSE 0 END) AS dataAnomaly,
+      SUM(CASE WHEN pairs.status = 'valid' AND ABS(ISNULL(pairs.percentChange, 0)) >= 20 THEN 1 ELSE 0 END) AS significantValidCount
+    FROM (${pairs}) pairs
+  `;
+  const [rowsResult, countResult, summaryResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery),
+    executeReadonlyQuery(countQuery),
+    executeReadonlyQuery(summaryQuery)
+  ]);
+  const summary = summaryResult.recordset?.[0] || {};
+  return {
+    rows: rowsResult.recordset || [],
+    totalCount: countResult.recordset?.[0]?.totalCount || 0,
+    page: paging.page,
+    pageSize: paging.pageSize,
+    sort: sort.sort,
+    status: statusFilter.status,
+    summary
+  };
 }
 
 export async function analyticsItemProfit({ itemId, dateFrom, dateTo, from, to } = {}) {
@@ -3318,13 +3512,13 @@ export async function analyticsAlerts() {
   const [shortages, expiry, priceChanges] = await Promise.all([
     analyticsSmartShortages(),
     analyticsExpiry({ days: 30 }),
-    analyticsPriceChanges()
+    analyticsPriceChanges({ status: 'valid', pageSize: 1 })
   ]);
   const alerts = [];
   if (shortages.rows.length) alerts.push({ severity: 'high', title: 'أصناف نافدة', value: shortages.rows.length, message: 'توجد أصناف رصيدها صفر أو أقل.' });
   if (expiry.rows.length) alerts.push({ severity: 'medium', title: 'قرب انتهاء', value: expiry.rows.length, message: 'توجد أصناف تنتهي خلال 30 يوم.' });
-  const significant = (priceChanges.rows || []).filter((row) => Math.abs(Number(row.percentChange || 0)) >= 20);
-  if (significant.length) alerts.push({ severity: 'medium', title: 'تغير سعر شراء', value: significant.length, message: 'توجد أصناف تغير سعر شرائها بنسبة 20% أو أكثر.' });
+  const significantValidCount = Number(priceChanges.summary?.significantValidCount || 0);
+  if (significantValidCount) alerts.push({ severity: 'medium', title: 'تغير سعر شراء', value: significantValidCount, message: 'توجد أصناف موثوقة تغير سعر شرائها بنسبة 20% أو أكثر.' });
   return { rows: alerts };
 }
 

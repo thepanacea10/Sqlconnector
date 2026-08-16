@@ -520,8 +520,8 @@ app.get(
 
 app.get(
   '/api/analytics/price-changes',
-  asyncRoute(async (_req, res) => {
-    const result = await almohasebProfile.analyticsPriceChanges();
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsPriceChanges(req.query);
     res.json({ success: true, profile: 'almohaseb', ...result });
   })
 );
