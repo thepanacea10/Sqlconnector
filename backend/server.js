@@ -351,13 +351,23 @@ app.get(
 app.get(
   '/api/items/stock',
   asyncRoute(async (req, res) => {
-    const rows = await almohasebProfile.getItemStock({
+    const result = await almohasebProfile.getItemStock({
       search: req.query.search,
       availableOnly: req.query.availableOnly,
       sort: req.query.sort,
-      limit: req.query.limit
+      limit: req.query.limit,
+      page: req.query.page,
+      pageSize: req.query.pageSize
     });
-    res.json({ success: true, profile: 'almohaseb', rows });
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
+  '/api/items/summary',
+  asyncRoute(async (_req, res) => {
+    const result = await almohasebProfile.getInventorySummary();
+    res.json({ success: true, profile: 'almohaseb', ...result });
   })
 );
 
@@ -382,7 +392,10 @@ app.get(
   asyncRoute(async (req, res) => {
     const result = await almohasebProfile.getOutOfStockItems({
       search: req.query.search,
-      sort: req.query.sort
+      sort: req.query.sort,
+      limit: req.query.limit,
+      page: req.query.page,
+      pageSize: req.query.pageSize
     });
     res.json({ success: true, profile: 'almohaseb', ...result });
   })
@@ -394,7 +407,10 @@ app.get(
     const result = await almohasebProfile.getItemExpiryReport({
       search: req.query.search,
       days: req.query.days,
-      bucket: req.query.bucket
+      bucket: req.query.bucket,
+      limit: req.query.limit,
+      page: req.query.page,
+      pageSize: req.query.pageSize
     });
     res.json({ success: true, profile: 'almohaseb', ...result });
   })

@@ -1364,6 +1364,35 @@ function itemSortClause(sort) {
   return 'itemName ASC';
 }
 
+function paginatedItemSortClause(sort) {
+  if (sort === 'quantity') return 'currentQuantity DESC, itemName ASC';
+  if (sort === 'expiry') return 'expiryDate ASC, itemName ASC';
+  return 'itemName ASC';
+}
+
+function parsePagination({ page, pageSize, limit } = {}) {
+  const requestedPage = Number(page || 1);
+  const requestedPageSize = String(limit || '').toLowerCase() === 'all'
+    ? 10000
+    : Number(pageSize || limit || 500);
+  const safePage = Math.max(Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 1, 1);
+  const safePageSize = Math.min(Math.max(Number.isFinite(requestedPageSize) ? Math.floor(requestedPageSize) : 500, 1), 10000);
+  const startRow = (safePage - 1) * safePageSize + 1;
+  const endRow = safePage * safePageSize;
+  return { page: safePage, pageSize: safePageSize, startRow, endRow };
+}
+
+function paginatedResponse(rows, totalCount, pagination, quantityKey) {
+  const safeTotal = Number(totalCount || 0);
+  return {
+    rows: withFormattedStockQuantity(rows || [], quantityKey),
+    totalCount: safeTotal,
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    hasMore: pagination.page * pagination.pageSize < safeTotal
+  };
+}
+
 function stockNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
@@ -1403,7 +1432,123 @@ function withFormattedStockQuantity(rows, quantityKey = 'currentQuantity') {
   });
 }
 
-export async function getItemStock({ search, availableOnly, sort, limit } = {}) {
+export async function getItemStock({ search, availableOnly, sort, limit, page, pageSize } = {}) {
+  const term = searchText(search);
+  const onlyAvailable = String(availableOnly || '').toLowerCase() === 'true';
+  const pagination = parsePagination({ page, pageSize, limit });
+  const fromClause = `
+    FROM dbo.The_Items i
+    ${itemJoins}
+    OUTER APPLY (
+      SELECT TOP (1)
+        CONVERT(NVARCHAR(50), idt.ItemDetails_No) AS batchNo,
+        idt.Exp_date AS expiryDate
+      FROM dbo.The_ItemDetails idt
+      WHERE idt.Item_No = i.Item_No
+        AND ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0) <> 0
+      ORDER BY
+        CASE WHEN idt.Exp_date IS NULL THEN 1 ELSE 0 END,
+        idt.Exp_date ASC,
+        idt.ItemDetails_No ASC
+    ) batchInfo
+    WHERE (
+      @search = N''
+      OR CONVERT(NVARCHAR(4000), i.Scientific_Name) LIKE @searchLike
+      OR CONVERT(NVARCHAR(4000), tradeName.Trade_Name) LIKE @searchLike
+      OR CONVERT(NVARCHAR(4000), barcode.Barcode) LIKE @searchLike
+      OR CONVERT(NVARCHAR(50), i.Item_No) LIKE @searchLike
+    )
+    ${onlyAvailable ? 'AND ISNULL(stock.availableQuantity, 0) > 0' : ''}
+  `;
+  const rowsQuery = `
+    SELECT
+      itemCode,
+      itemId,
+      itemName,
+      barcode,
+      currentQuantity,
+      packSize,
+      unitName,
+      batch,
+      expiryDate,
+      purchasePrice,
+      salePrice
+    FROM (
+      SELECT
+        baseRows.*,
+        ROW_NUMBER() OVER (ORDER BY ${paginatedItemSortClause(sort)}) AS rowNumber
+      FROM (
+        SELECT
+          i.Item_No AS itemCode,
+          i.Item_No AS itemId,
+          COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
+          barcode.Barcode AS barcode,
+          ISNULL(stock.availableQuantity, 0) AS currentQuantity,
+          unitInfo.Unit_OldQuantity AS packSize,
+          unitInfo.Unit_Type AS unitName,
+          batchInfo.batchNo AS batch,
+          batchInfo.expiryDate AS expiryDate,
+          stock.cost AS purchasePrice,
+          price.Charge_Value AS salePrice
+        ${fromClause}
+      ) baseRows
+    ) numberedRows
+    WHERE rowNumber BETWEEN @startRow AND @endRow
+    ORDER BY rowNumber
+  `;
+  const countQuery = `
+    SELECT COUNT(1) AS totalCount
+    ${fromClause}
+  `;
+
+  const [rowsResult, countResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, (request) => {
+      bindItemSearch(request, term);
+      request.input('startRow', sql.Int, pagination.startRow);
+      request.input('endRow', sql.Int, pagination.endRow);
+    }),
+    executeReadonlyQuery(countQuery, (request) => bindItemSearch(request, term))
+  ]);
+  return paginatedResponse(rowsResult.recordset || [], countResult.recordset?.[0]?.totalCount, pagination);
+}
+
+export async function getInventorySummary() {
+  const outOfStockClause = `
+    FROM dbo.The_Items i
+    ${itemJoins}
+    WHERE ISNULL(i.Item_Status, 0) = 0
+      AND ISNULL(stock.availableQuantity, 0) <= 0
+  `;
+  const lowStockClause = `
+    FROM dbo.The_Items i
+    ${itemJoins}
+    WHERE ISNULL(stock.availableQuantity, 0) > 0
+      AND ISNULL(stock.availableQuantity, 0) < ISNULL(i.Out_quantitative, 0)
+  `;
+  const expiryClause = `
+    FROM dbo.The_ItemDetails idt
+    INNER JOIN dbo.The_Items i ON i.Item_No = idt.Item_No
+    WHERE idt.Exp_date IS NOT NULL
+      AND idt.Exp_date >= DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0)
+      AND idt.Exp_date < DATEADD(DAY, 91, DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0))
+      AND ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0) > 0
+  `;
+  const query = `
+    SELECT
+      (SELECT COUNT(1) ${outOfStockClause}) AS outOfStockCount,
+      (SELECT COUNT(1) ${lowStockClause}) AS lowStockCount,
+      (SELECT COUNT(1) ${expiryClause}) AS expiryCount
+  `;
+  const result = await executeReadonlyQuery(query);
+  const row = result.recordset?.[0] || {};
+  return {
+    outOfStockCount: Number(row.outOfStockCount || 0),
+    lowStockCount: Number(row.lowStockCount || 0),
+    expiryCount: Number(row.expiryCount || 0)
+  };
+}
+
+export async function getItemStockLegacy({ search, availableOnly, sort, limit } = {}) {
   const term = searchText(search);
   const onlyAvailable = String(availableOnly || '').toLowerCase() === 'true';
   const requestedLimit = String(limit || '').toLowerCase() === 'all' ? 10000 : Number(limit || 500);
@@ -1450,8 +1595,9 @@ export async function getItemStock({ search, availableOnly, sort, limit } = {}) 
   return withFormattedStockQuantity(result.recordset || []);
 }
 
-export async function getOutOfStockItems({ search, sort } = {}) {
+export async function getOutOfStockItems({ search, sort, page, pageSize, limit } = {}) {
   const term = searchText(search);
+  const pagination = parsePagination({ page, pageSize, limit: page || pageSize || limit ? limit : 'all' });
   const fromClause = `
     FROM dbo.The_Items i
     ${itemJoins}
@@ -1485,19 +1631,39 @@ export async function getOutOfStockItems({ search, sort } = {}) {
   `;
   const rowsQuery = `
     SELECT
-      i.Item_No AS itemCode,
-      i.Item_No AS itemId,
-      COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
-      barcode.Barcode AS barcode,
-      ISNULL(stock.availableQuantity, 0) AS currentQuantity,
-      unitInfo.Unit_OldQuantity AS packSize,
-      stock.cost AS purchasePrice,
-      price.Charge_Value AS salePrice,
-      lastSale.lastSaleDate,
-      lastPurchase.lastPurchaseDate,
-      lastPurchase.lastSupplier
-    ${fromClause}
-    ORDER BY ${sort === 'quantity' ? 'ISNULL(stock.availableQuantity, 0) ASC, itemName ASC' : 'itemName ASC'}
+      itemCode,
+      itemId,
+      itemName,
+      barcode,
+      currentQuantity,
+      packSize,
+      purchasePrice,
+      salePrice,
+      lastSaleDate,
+      lastPurchaseDate,
+      lastSupplier
+    FROM (
+      SELECT
+        baseRows.*,
+        ROW_NUMBER() OVER (ORDER BY ${sort === 'quantity' ? 'currentQuantity ASC, itemName ASC' : 'itemName ASC'}) AS rowNumber
+      FROM (
+        SELECT
+          i.Item_No AS itemCode,
+          i.Item_No AS itemId,
+          COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
+          barcode.Barcode AS barcode,
+          ISNULL(stock.availableQuantity, 0) AS currentQuantity,
+          unitInfo.Unit_OldQuantity AS packSize,
+          stock.cost AS purchasePrice,
+          price.Charge_Value AS salePrice,
+          lastSale.lastSaleDate,
+          lastPurchase.lastPurchaseDate,
+          lastPurchase.lastSupplier
+        ${fromClause}
+      ) baseRows
+    ) numberedRows
+    WHERE rowNumber BETWEEN @startRow AND @endRow
+    ORDER BY rowNumber
   `;
   const countQuery = `
     SELECT COUNT(1) AS totalCount
@@ -1505,13 +1671,14 @@ export async function getOutOfStockItems({ search, sort } = {}) {
   `;
 
   const [rowsResult, countResult] = await Promise.all([
-    executeReadonlyQuery(rowsQuery, (request) => bindItemSearch(request, term)),
+    executeReadonlyQuery(rowsQuery, (request) => {
+      bindItemSearch(request, term);
+      request.input('startRow', sql.Int, pagination.startRow);
+      request.input('endRow', sql.Int, pagination.endRow);
+    }),
     executeReadonlyQuery(countQuery, (request) => bindItemSearch(request, term))
   ]);
-  return {
-    rows: withFormattedStockQuantity(rowsResult.recordset || []),
-    totalCount: Number(countResult.recordset?.[0]?.totalCount || 0)
-  };
+  return paginatedResponse(rowsResult.recordset || [], countResult.recordset?.[0]?.totalCount, pagination);
 }
 
 function expiryBucketFilter(bucket) {
@@ -1547,28 +1714,16 @@ function expiryBucketFilter(bucket) {
   return null;
 }
 
-export async function getItemExpiryReport({ search, days, bucket } = {}) {
+export async function getItemExpiryReport({ search, days, bucket, page, pageSize, limit } = {}) {
   const term = searchText(search);
   const safeDays = parseDays(days || 90);
   const bucketConfig = expiryBucketFilter(bucket);
+  const pagination = parsePagination({ page, pageSize, limit: page || pageSize || limit ? limit : 'all' });
   const dateFilter = bucketConfig
     ? bucketConfig.filter
     : `AND idt.Exp_date >= DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0)
       AND idt.Exp_date < DATEADD(DAY, @days + 1, DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0))`;
-  const query = `
-    SELECT
-      i.Item_No AS itemCode,
-      i.Item_No AS itemId,
-      COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
-      barcode.Barcode AS barcode,
-      CONVERT(NVARCHAR(50), idt.ItemDetails_No) AS batch,
-      ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0) AS quantity,
-      idt.Exp_date AS expiryDate,
-      DATEDIFF(DAY, DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0), idt.Exp_date) AS daysRemaining,
-      idt.Item_Cost AS purchasePrice,
-      price.Charge_Value AS salePrice,
-      unitInfo.Unit_OldQuantity AS packSize,
-      unitInfo.Unit_Type AS unitName
+  const fromClause = `
     FROM dbo.The_ItemDetails idt
     INNER JOIN dbo.The_Items i ON i.Item_No = idt.Item_No
     OUTER APPLY (
@@ -1604,17 +1759,66 @@ export async function getItemExpiryReport({ search, days, bucket } = {}) {
         OR CONVERT(NVARCHAR(4000), barcode.Barcode) LIKE @searchLike
         OR CONVERT(NVARCHAR(50), i.Item_No) LIKE @searchLike
       )
-    ORDER BY idt.Exp_date ASC, itemName ASC
+  `;
+  const rowsQuery = `
+    SELECT
+      itemCode,
+      itemId,
+      itemName,
+      barcode,
+      batch,
+      quantity,
+      expiryDate,
+      daysRemaining,
+      purchasePrice,
+      salePrice,
+      packSize,
+      unitName
+    FROM (
+      SELECT
+        baseRows.*,
+        ROW_NUMBER() OVER (ORDER BY expiryDate ASC, itemName ASC) AS rowNumber
+      FROM (
+        SELECT
+          i.Item_No AS itemCode,
+          i.Item_No AS itemId,
+          COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
+          barcode.Barcode AS barcode,
+          CONVERT(NVARCHAR(50), idt.ItemDetails_No) AS batch,
+          ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0) AS quantity,
+          idt.Exp_date AS expiryDate,
+          DATEDIFF(DAY, DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), 0), idt.Exp_date) AS daysRemaining,
+          idt.Item_Cost AS purchasePrice,
+          price.Charge_Value AS salePrice,
+          unitInfo.Unit_OldQuantity AS packSize,
+          unitInfo.Unit_Type AS unitName
+        ${fromClause}
+      ) baseRows
+    ) numberedRows
+    WHERE rowNumber BETWEEN @startRow AND @endRow
+    ORDER BY rowNumber
+  `;
+  const countQuery = `
+    SELECT COUNT(1) AS totalCount
+    ${fromClause}
   `;
 
-  const result = await executeReadonlyQuery(query, (request) => {
+  const bindExpiry = (request) => {
     bindItemSearch(request, term);
     if (!bucketConfig) request.input('days', sql.Int, safeDays);
-  });
+  };
+  const [rowsResult, countResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, (request) => {
+      bindExpiry(request);
+      request.input('startRow', sql.Int, pagination.startRow);
+      request.input('endRow', sql.Int, pagination.endRow);
+    }),
+    executeReadonlyQuery(countQuery, bindExpiry)
+  ]);
   return {
     days: bucketConfig ? null : safeDays,
     bucket: bucketConfig?.bucket || null,
-    rows: withFormattedStockQuantity(result.recordset || [], 'quantity')
+    ...paginatedResponse(rowsResult.recordset || [], countResult.recordset?.[0]?.totalCount, pagination, 'quantity')
   };
 }
 
