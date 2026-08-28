@@ -24,6 +24,16 @@ import { processAssistantMessage } from './services/aiAssistant.js';
 import { askSqlAssistant } from './services/sqlAiAssistant.js';
 import { startTelegramBot } from './telegramBot.js';
 import stockcountRoutes from './routes/stockcountRoutes.js';
+import {
+  checkStockCheckLoginLimit,
+  checkStockCheckSearchLimit,
+  createStockCheckSession,
+  destroyStockCheckSession,
+  recordStockCheckLoginSuccess,
+  requireStockCheckSession,
+  stockCheckSessionInfo,
+  verifyStockCheckPin
+} from './stockCheckSecurity.js';
 
 const app = express();
 const host = process.env.API_HOST || '0.0.0.0';
@@ -34,6 +44,8 @@ const appVersion = packageInfo.version || '0.0.0';
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/v1/stockcount', stockcountRoutes);
+
+let stockCheckLastSuccessfulCheck = null;
 
 function backendRuntimeStatus() {
   return {
@@ -161,6 +173,113 @@ app.get(
         profile: 'almohaseb',
         ...backendRuntimeStatus(),
         ...publicConnectionStatus(settings, false, messageFromError(error))
+      });
+    }
+  })
+);
+
+app.post(
+  '/api/stock-check/login',
+  asyncRoute(async (req, res) => {
+    const limit = checkStockCheckLoginLimit(req);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      res.status(429).json({ success: false, message: 'محاولات كثيرة. حاول لاحقًا.' });
+      return;
+    }
+
+    const pin = String(req.body?.pin ?? req.body?.PIN ?? '');
+    let valid = false;
+    try {
+      valid = await verifyStockCheckPin(pin);
+    } catch (error) {
+      console.error('[stock-check] PIN verification configuration error', error);
+    }
+
+    if (!valid) {
+      res.status(401).json({ success: false, message: 'رمز الدخول غير صحيح.' });
+      return;
+    }
+
+    recordStockCheckLoginSuccess(req);
+    const session = createStockCheckSession(res, req);
+    res.json({
+      success: true,
+      authenticated: true,
+      expiresAt: session.expiresAt
+    });
+  })
+);
+
+app.get(
+  '/api/stock-check/session',
+  asyncRoute(async (req, res) => {
+    res.json({ success: true, ...stockCheckSessionInfo(req) });
+  })
+);
+
+app.post(
+  '/api/stock-check/logout',
+  asyncRoute(async (req, res) => {
+    destroyStockCheckSession(req, res);
+    res.json({ success: true, authenticated: false });
+  })
+);
+
+app.get(
+  '/api/stock-check/status',
+  requireStockCheckSession,
+  asyncRoute(async (_req, res) => {
+    try {
+      const status = await almohasebProfile.getStockCheckLiveStatus();
+      stockCheckLastSuccessfulCheck = new Date(status.serverTime).toISOString();
+      res.json({
+        success: true,
+        live: true,
+        serverTime: stockCheckLastSuccessfulCheck,
+        lastSuccessfulCheck: stockCheckLastSuccessfulCheck
+      });
+    } catch {
+      res.status(503).json({
+        success: false,
+        live: false,
+        message: 'تعذر التحقق من المخزون حاليًا',
+        lastSuccessfulCheck: stockCheckLastSuccessfulCheck
+      });
+    }
+  })
+);
+
+app.get(
+  '/api/stock-check/search',
+  requireStockCheckSession,
+  asyncRoute(async (req, res) => {
+    const limit = checkStockCheckSearchLimit(req);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      res.status(429).json({ success: false, message: 'طلبات كثيرة. حاول بعد قليل.' });
+      return;
+    }
+
+    try {
+      const result = await almohasebProfile.searchStockCheckItems({
+        query: req.query.q,
+        page: req.query.page,
+        pageSize: req.query.pageSize
+      });
+      stockCheckLastSuccessfulCheck = new Date().toISOString();
+      res.json({
+        success: true,
+        live: true,
+        lastSuccessfulCheck: stockCheckLastSuccessfulCheck,
+        ...result
+      });
+    } catch {
+      res.status(503).json({
+        success: false,
+        live: false,
+        message: 'تعذر التحقق من المخزون حاليًا',
+        lastSuccessfulCheck: stockCheckLastSuccessfulCheck
       });
     }
   })

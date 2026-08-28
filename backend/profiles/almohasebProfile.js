@@ -1512,6 +1512,152 @@ export async function getItemStock({ search, availableOnly, sort, limit, page, p
   return paginatedResponse(rowsResult.recordset || [], countResult.recordset?.[0]?.totalCount, pagination);
 }
 
+function parseStockCheckPagination({ page, pageSize } = {}) {
+  const requestedPage = Number(page || 1);
+  const requestedPageSize = Number(pageSize || 20);
+  const safePage = Math.max(Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 1, 1);
+  const safePageSize = Math.min(Math.max(Number.isFinite(requestedPageSize) ? Math.floor(requestedPageSize) : 20, 1), 50);
+  return {
+    page: safePage,
+    pageSize: safePageSize,
+    startRow: (safePage - 1) * safePageSize + 1,
+    endRow: safePage * safePageSize
+  };
+}
+
+function isNumericSearch(search) {
+  return /^[0-9]+$/.test(String(search || '').trim());
+}
+
+function mapStockCheckRows(rows) {
+  return withFormattedStockQuantity(rows || []).map((row) => ({
+    itemCode: row.itemCode == null ? null : String(row.itemCode),
+    name: row.itemName || '',
+    barcode: row.barcode == null ? null : String(row.barcode).trim(),
+    sellingPrice: row.sellingPrice == null ? null : stockNumber(row.sellingPrice),
+    quantity: stockNumber(row.currentQuantity),
+    formattedQuantity: row.formattedQuantity || '',
+    unit: row.unitName || null,
+    availability: stockNumber(row.currentQuantity) > 0 ? 'available' : 'unavailable'
+  }));
+}
+
+export async function searchStockCheckItems({ query, page, pageSize } = {}) {
+  const term = searchText(query);
+  const numeric = isNumericSearch(term);
+  const pagination = parseStockCheckPagination({ page, pageSize });
+
+  if (!term || (!numeric && term.length < 2)) {
+    return {
+      rows: [],
+      totalCount: 0,
+      page: pagination.page,
+      pageSize: pagination.pageSize,
+      hasMore: false,
+      queryTooShort: Boolean(term)
+    };
+  }
+
+  const fromClause = `
+    FROM dbo.The_Items i
+    ${itemJoins}
+    WHERE ISNULL(i.Item_Status, 0) = 0
+      AND (
+        CONVERT(NVARCHAR(50), i.Item_No) = @search
+        OR EXISTS (
+          SELECT 1
+          FROM dbo.The_Barcode searchBarcode
+          WHERE searchBarcode.Item_No = i.Item_No
+            AND CONVERT(NVARCHAR(4000), searchBarcode.Barcode) LIKE @searchLike
+        )
+        OR CONVERT(NVARCHAR(4000), i.Scientific_Name) LIKE @searchLike
+        OR CONVERT(NVARCHAR(4000), tradeName.Trade_Name) LIKE @searchLike
+      )
+  `;
+
+  const rankingExpression = `
+    CASE
+      WHEN EXISTS (
+        SELECT 1 FROM dbo.The_Barcode exactBarcode
+        WHERE exactBarcode.Item_No = i.Item_No
+          AND LTRIM(RTRIM(CONVERT(NVARCHAR(4000), exactBarcode.Barcode))) = @search
+      ) THEN 1
+      WHEN EXISTS (
+        SELECT 1 FROM dbo.The_Barcode prefixBarcode
+        WHERE prefixBarcode.Item_No = i.Item_No
+          AND LTRIM(RTRIM(CONVERT(NVARCHAR(4000), prefixBarcode.Barcode))) LIKE @searchPrefix
+      ) THEN 2
+      WHEN CONVERT(NVARCHAR(50), i.Item_No) = @search THEN 3
+      WHEN CONVERT(NVARCHAR(4000), COALESCE(tradeName.Trade_Name, i.Scientific_Name)) LIKE @searchPrefix THEN 4
+      ELSE 5
+    END
+  `;
+
+  const rowsQuery = `
+    SELECT
+      itemCode,
+      itemName,
+      barcode,
+      currentQuantity,
+      packSize,
+      unitName,
+      sellingPrice
+    FROM (
+      SELECT
+        baseRows.*,
+        ROW_NUMBER() OVER (ORDER BY searchRank ASC, itemName ASC, itemCode ASC) AS rowNumber
+      FROM (
+        SELECT
+          i.Item_No AS itemCode,
+          COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
+          barcode.Barcode AS barcode,
+          ISNULL(stock.availableQuantity, 0) AS currentQuantity,
+          unitInfo.Unit_OldQuantity AS packSize,
+          unitInfo.Unit_Type AS unitName,
+          price.Charge_Value AS sellingPrice,
+          ${rankingExpression} AS searchRank
+        ${fromClause}
+      ) baseRows
+    ) numberedRows
+    WHERE rowNumber BETWEEN @startRow AND @endRow
+    ORDER BY rowNumber ASC
+  `;
+
+  const countQuery = `SELECT COUNT(1) AS totalCount ${fromClause}`;
+
+  const bind = (request) => {
+    bindItemSearch(request, term);
+    request.input('searchPrefix', sql.NVarChar, `${term}%`);
+  };
+
+  const [rowsResult, countResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, (request) => {
+      bind(request);
+      request.input('startRow', sql.Int, pagination.startRow);
+      request.input('endRow', sql.Int, pagination.endRow);
+    }),
+    executeReadonlyQuery(countQuery, bind)
+  ]);
+
+  const totalCount = Number(countResult.recordset?.[0]?.totalCount || 0);
+  return {
+    rows: mapStockCheckRows(rowsResult.recordset || []),
+    totalCount,
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    hasMore: pagination.page * pagination.pageSize < totalCount,
+    queryTooShort: false
+  };
+}
+
+export async function getStockCheckLiveStatus() {
+  const result = await executeReadonlyQuery('SELECT GETDATE() AS serverTime');
+  return {
+    live: true,
+    serverTime: result.recordset?.[0]?.serverTime || new Date()
+  };
+}
+
 export async function getInventorySummary() {
   const outOfStockClause = `
     FROM dbo.The_Items i
