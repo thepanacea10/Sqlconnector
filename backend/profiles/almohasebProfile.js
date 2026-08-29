@@ -1650,6 +1650,71 @@ export async function searchStockCheckItems({ query, page, pageSize } = {}) {
   };
 }
 
+export async function listStockCheckInventory({ page, pageSize } = {}) {
+  const requestedPage = Number(page || 1);
+  const requestedPageSize = Number(pageSize || 200);
+  const pagination = {
+    page: Math.max(Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 1, 1),
+    pageSize: Math.min(Math.max(Number.isFinite(requestedPageSize) ? Math.floor(requestedPageSize) : 200, 20), 300)
+  };
+  pagination.startRow = (pagination.page - 1) * pagination.pageSize + 1;
+  pagination.endRow = pagination.page * pagination.pageSize;
+
+  const fromClause = `
+    FROM dbo.The_Items i
+    ${itemJoins}
+    WHERE ISNULL(i.Item_Status, 0) = 0
+  `;
+
+  const rowsQuery = `
+    SELECT
+      itemCode,
+      itemName,
+      barcode,
+      currentQuantity,
+      packSize,
+      unitName,
+      sellingPrice
+    FROM (
+      SELECT
+        baseRows.*,
+        ROW_NUMBER() OVER (ORDER BY itemName ASC, itemCode ASC) AS rowNumber
+      FROM (
+        SELECT
+          i.Item_No AS itemCode,
+          COALESCE(tradeName.Trade_Name, i.Scientific_Name) AS itemName,
+          barcode.Barcode AS barcode,
+          ISNULL(stock.availableQuantity, 0) AS currentQuantity,
+          unitInfo.Unit_OldQuantity AS packSize,
+          unitInfo.Unit_Type AS unitName,
+          price.Charge_Value AS sellingPrice
+        ${fromClause}
+      ) baseRows
+    ) numberedRows
+    WHERE rowNumber BETWEEN @startRow AND @endRow
+    ORDER BY rowNumber ASC
+  `;
+
+  const countQuery = `SELECT COUNT(1) AS totalCount ${fromClause}`;
+
+  const [rowsResult, countResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, (request) => {
+      request.input('startRow', sql.Int, pagination.startRow);
+      request.input('endRow', sql.Int, pagination.endRow);
+    }),
+    executeReadonlyQuery(countQuery)
+  ]);
+
+  const totalCount = Number(countResult.recordset?.[0]?.totalCount || 0);
+  return {
+    rows: mapStockCheckRows(rowsResult.recordset || []),
+    totalCount,
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    hasMore: pagination.page * pagination.pageSize < totalCount
+  };
+}
+
 export async function getStockCheckLiveStatus() {
   const result = await executeReadonlyQuery('SELECT GETDATE() AS serverTime');
   return {

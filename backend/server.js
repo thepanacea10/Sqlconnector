@@ -285,6 +285,40 @@ app.get(
   })
 );
 
+app.get(
+  '/api/stock-check/inventory',
+  requireStockCheckSession,
+  asyncRoute(async (req, res) => {
+    const limit = checkStockCheckSearchLimit(req);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      res.status(429).json({ success: false, message: 'طلبات كثيرة. حاول بعد قليل.' });
+      return;
+    }
+
+    try {
+      const result = await almohasebProfile.listStockCheckInventory({
+        page: req.query.page,
+        pageSize: req.query.pageSize
+      });
+      stockCheckLastSuccessfulCheck = new Date().toISOString();
+      res.json({
+        success: true,
+        live: true,
+        lastSuccessfulCheck: stockCheckLastSuccessfulCheck,
+        ...result
+      });
+    } catch {
+      res.status(503).json({
+        success: false,
+        live: false,
+        message: 'تعذر التحقق من المخزون حاليًا',
+        lastSuccessfulCheck: stockCheckLastSuccessfulCheck
+      });
+    }
+  })
+);
+
 app.post(
   '/api/chat',
   asyncRoute(async (req, res) => {
