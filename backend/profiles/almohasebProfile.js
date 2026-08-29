@@ -2837,6 +2837,25 @@ export async function getRevenueDetails(filters = {}) {
     ORDER BY total DESC, sellerName ASC
   `;
 
+  const sellerSourceTotalsQuery = `
+    SELECT
+      sellerId,
+      sellerName,
+      revenueSource,
+      ISNULL(SUM(amount), 0) AS total,
+      COUNT(*) AS movementCount
+    ${revenueFrom}
+    GROUP BY sellerId, sellerName, revenueSource
+    ORDER BY sellerName ASC,
+      CASE
+        WHEN revenueSource = N'مبيعات نقدية' THEN 1
+        WHEN revenueSource = N'سداد مدينين' THEN 2
+        WHEN revenueSource = N'مردودات' THEN 99
+        ELSE 10
+      END,
+      revenueSource
+  `;
+
   const filterOptionsQuery = `
     SELECT 'seller' AS optionType, CONVERT(NVARCHAR(50), sellerId) AS optionValue, sellerName AS optionLabel
     ${revenueRowsFrom(dateRange, {})}
@@ -2856,11 +2875,12 @@ export async function getRevenueDetails(filters = {}) {
     ORDER BY optionType, optionLabel
   `;
 
-  const [rowsResult, summaryResult, sourcesResult, sellerTotalsResult, filterOptionsResult] = await Promise.all([
+  const [rowsResult, summaryResult, sourcesResult, sellerTotalsResult, sellerSourceTotalsResult, filterOptionsResult] = await Promise.all([
     executeReadonlyQuery(rowsQuery, bindFilters),
     executeReadonlyQuery(summaryQuery, bindFilters),
     executeReadonlyQuery(sourcesQuery, bindFilters),
     executeReadonlyQuery(sellerTotalsQuery, bindFilters),
+    executeReadonlyQuery(sellerSourceTotalsQuery, bindFilters),
     executeReadonlyQuery(filterOptionsQuery, (request) => bindDateRange(request, dateRange))
   ]);
 
@@ -2895,6 +2915,7 @@ export async function getRevenueDetails(filters = {}) {
     },
     sources: sourcesResult.recordset || [],
     sellerTotals: sellerTotalsResult.recordset || [],
+    sellerSourceTotals: sellerSourceTotalsResult.recordset || [],
     filterOptions: filterOptionsResult.recordset || [],
     rows: rowsResult.recordset || []
   };
