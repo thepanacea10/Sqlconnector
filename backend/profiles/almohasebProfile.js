@@ -201,7 +201,7 @@ function revenueRowsSubquery(dateRange) {
       ov.Outstandingvalues_No AS movementNo,
       ov.Movementrestrictions_No AS invoiceNo,
       ov.Date_paid AS movementDate,
-      ov.Item_Add AS movementCreatedAt,
+      CONVERT(VARCHAR(19), ov.Item_Add, 120) AS movementCreatedAt,
       CASE
         WHEN CONVERT(CHAR(8), ov.Item_Add, 108) <> '00:00:00' THEN 1
         ELSE 0
@@ -2545,6 +2545,9 @@ export async function getTradingProfit({ dateFrom, dateTo } = {}) {
       N'The_Outstandingvalues' AS sourceTable,
       movementNo,
       invoiceNo,
+      movementCreatedAt,
+      movementHasRealTime,
+      movementDateTimeSource,
       customerName,
       sellerName,
       paymentMethod,
@@ -2602,7 +2605,7 @@ export async function getTradingProfit({ dateFrom, dateTo } = {}) {
       officialRevenue,
       actualNetRevenue,
       revenueDifference,
-      message: isSnapshotIncomplete ? 'ملخص المتاجرة غير محدث — توجد حركات إيراد لم تظهر في جدول الأرباح الرسمي.' : ''
+      message: isSnapshotIncomplete ? 'قد لا تكون بيانات المتاجرة محدثة بالكامل' : ''
     },
     movements: movementsResult.recordset || [],
     actualMovements: actualMovementsResult.recordset || []
