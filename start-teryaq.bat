@@ -2,8 +2,12 @@
 
 cd /d E:\Test_Almohaseb_Old\TeryaqSQLConnector
 
-start "Teryaq Backend" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-backend-production.ps1" -Restart
+echo Starting Teryaq services...
 
-timeout /t 5 >nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-backend-production.ps1"
 
-start "Teryaq Frontend" cmd /k npm.cmd run frontend
+powershell.exe -NoProfile -Command "Start-Sleep -Seconds 5"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "if (-not (Get-NetTCPConnection -LocalPort 5180 -State Listen -ErrorAction SilentlyContinue)) { Start-Process -FilePath 'E:\Test_Almohaseb_Old\teryaq-flow\start-flow-production.bat' -WorkingDirectory 'E:\Test_Almohaseb_Old\teryaq-flow' -WindowStyle Hidden }"
+
+echo Teryaq startup commands completed.
