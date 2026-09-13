@@ -3303,16 +3303,47 @@ export async function analyticsDailyProfit(filters = {}) {
     getTradingProfit({ dateFrom, dateTo })
   ]);
   const bind = (request) => bindDateRange(request, dateRange);
+  const salesUnitInfo = `
+    SELECT
+      Item_No,
+      COALESCE(
+        MAX(CASE WHEN Default_Unit = 1 THEN Unit_Type ELSE NULL END),
+        MAX(Unit_Type)
+      ) AS Unit_Type,
+      COALESCE(
+        MAX(CASE WHEN Default_Unit = 1 THEN Unit_OldQuantity ELSE NULL END),
+        MAX(Unit_OldQuantity),
+        1
+      ) AS Unit_OldQuantity
+    FROM dbo.The_Units
+    GROUP BY Item_No
+  `;
+  const unitFactor = `CASE WHEN ISNULL(unitInfo.Unit_OldQuantity, 0) = 0 THEN 1 ELSE unitInfo.Unit_OldQuantity END`;
+  const normalizedSalesValue = `ISNULL(d.Charge_Value, 0) / ${unitFactor} * ABS(ISNULL(d.Item_Quntity, 0))`;
+  const normalizedCostValue = `ISNULL(d.Item_Cost, 0) / ${unitFactor} * ABS(ISNULL(d.Item_Quntity, 0))`;
+  const validAnalyticalLine = `
+    d.Item_Cost IS NOT NULL
+    AND unitInfo.Item_No IS NOT NULL
+    AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0
+    AND ISNULL(d.Item_Quntity, 0) <> 0
+  `;
   const itemsQuery = `
     SELECT TOP (20)
       d.Item_No AS itemId,
       COALESCE(tradeName.Trade_Name, item.Scientific_Name) AS itemName,
       SUM(ABS(ISNULL(d.Item_Quntity, 0))) AS quantity,
-      SUM(ISNULL(d.Charge_Value, 0)) AS salesValue,
-      SUM(CASE WHEN d.Item_Cost IS NULL THEN 0 ELSE ISNULL(d.Charge_Value, 0) - (ISNULL(d.Item_Cost, 0) * ABS(ISNULL(d.Item_Quntity, 0))) END) AS approximateProfit
+      SUM(ABS(ISNULL(d.Item_Quntity, 0)) / ${unitFactor}) AS businessQuantity,
+      MAX(unitInfo.Unit_Type) AS unitName,
+      MAX(unitInfo.Unit_OldQuantity) AS unitOldQuantity,
+      COUNT(*) AS movementCount,
+      SUM(CASE WHEN ${validAnalyticalLine} THEN 0 ELSE 1 END) AS unitRiskCount,
+      SUM(${normalizedSalesValue}) AS salesValue,
+      SUM(CASE WHEN ${validAnalyticalLine} THEN ${normalizedCostValue} ELSE 0 END) AS estimatedCost,
+      SUM(CASE WHEN ${validAnalyticalLine} THEN ${normalizedSalesValue} - ${normalizedCostValue} ELSE 0 END) AS approximateProfit
     FROM dbo.The_Details d
     INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
     LEFT JOIN dbo.The_Items item ON item.Item_No = d.Item_No
+    LEFT JOIN (${salesUnitInfo}) unitInfo ON unitInfo.Item_No = d.Item_No
     OUTER APPLY (
       SELECT TOP (1) t.Trade_Name
       FROM dbo.The_Trade t
@@ -3324,9 +3355,26 @@ export async function analyticsDailyProfit(filters = {}) {
     GROUP BY d.Item_No, COALESCE(tradeName.Trade_Name, item.Scientific_Name)
     ORDER BY approximateProfit DESC
   `;
+  const summaryQuery = `
+    SELECT
+      COUNT(*) AS movementCount,
+      COUNT(DISTINCT d.Item_No) AS itemCount,
+      SUM(ABS(ISNULL(d.Item_Quntity, 0))) AS quantity,
+      SUM(ABS(ISNULL(d.Item_Quntity, 0)) / ${unitFactor}) AS businessQuantity,
+      SUM(CASE WHEN ${validAnalyticalLine} THEN 0 ELSE 1 END) AS unitRiskCount,
+      SUM(${normalizedSalesValue}) AS salesValue,
+      SUM(CASE WHEN ${validAnalyticalLine} THEN ${normalizedCostValue} ELSE 0 END) AS estimatedCost,
+      SUM(CASE WHEN ${validAnalyticalLine} THEN ${normalizedSalesValue} - ${normalizedCostValue} ELSE 0 END) AS analyticalProfit
+    FROM dbo.The_Details d
+    INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
+    LEFT JOIN (${salesUnitInfo}) unitInfo ON unitInfo.Item_No = d.Item_No
+    WHERE mr.Account_No IN (1, 2)
+      AND ${dateRangeFilter('mr.Movementrestrictions_Date', dateRange)}
+  `;
   const mostSoldQuery = itemsQuery.replace('ORDER BY approximateProfit DESC', 'ORDER BY quantity DESC');
   const worstQuery = itemsQuery.replace('ORDER BY approximateProfit DESC', 'ORDER BY approximateProfit ASC');
-  const [bestItems, worstItems, mostSold] = await Promise.all([
+  const [summary, bestItems, worstItems, mostSold] = await Promise.all([
+    executeReadonlyQuery(summaryQuery, bind),
     executeReadonlyQuery(itemsQuery, bind),
     executeReadonlyQuery(worstQuery, bind),
     executeReadonlyQuery(mostSoldQuery, bind)
@@ -3336,6 +3384,7 @@ export async function analyticsDailyProfit(filters = {}) {
     dateTo,
     revenue: revenue.summary || {},
     tradingProfit: trading.summary || {},
+    summary: summary.recordset?.[0] || {},
     bestProfitItems: bestItems.recordset || [],
     worstProfitItems: worstItems.recordset || [],
     mostSoldItems: mostSold.recordset || []
