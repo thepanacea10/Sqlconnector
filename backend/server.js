@@ -672,6 +672,14 @@ app.get(
 );
 
 app.get(
+  '/api/analytics/profit-summary',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsProfitSummary(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
   '/api/analytics/smart-shortages',
   asyncRoute(async (_req, res) => {
     const result = await almohasebProfile.analyticsSmartShortages();

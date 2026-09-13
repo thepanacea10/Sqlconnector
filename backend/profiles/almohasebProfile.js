@@ -3294,15 +3294,7 @@ export async function analyticsItemCard({ itemId } = {}) {
   };
 }
 
-export async function analyticsDailyProfit(filters = {}) {
-  const dateRange = analyticsDateRange(filters);
-  const dateFrom = formatDateInputValue(dateRange.fromDate);
-  const dateTo = formatDateInputValue(dateRange.toDate);
-  const [revenue, trading] = await Promise.all([
-    getRevenueDetails({ dateFrom, dateTo }),
-    getTradingProfit({ dateFrom, dateTo })
-  ]);
-  const bind = (request) => bindDateRange(request, dateRange);
+function analyticalSalesProfitParts() {
   const salesUnitInfo = `
     SELECT
       Item_No,
@@ -3327,6 +3319,31 @@ export async function analyticsDailyProfit(filters = {}) {
     AND ISNULL(unitInfo.Unit_OldQuantity, 0) > 0
     AND ISNULL(d.Item_Quntity, 0) <> 0
   `;
+  return {
+    salesUnitInfo,
+    unitFactor,
+    normalizedSalesValue,
+    normalizedCostValue,
+    validAnalyticalLine
+  };
+}
+
+export async function analyticsDailyProfit(filters = {}) {
+  const dateRange = analyticsDateRange(filters);
+  const dateFrom = formatDateInputValue(dateRange.fromDate);
+  const dateTo = formatDateInputValue(dateRange.toDate);
+  const [revenue, trading] = await Promise.all([
+    getRevenueDetails({ dateFrom, dateTo }),
+    getTradingProfit({ dateFrom, dateTo })
+  ]);
+  const bind = (request) => bindDateRange(request, dateRange);
+  const {
+    salesUnitInfo,
+    unitFactor,
+    normalizedSalesValue,
+    normalizedCostValue,
+    validAnalyticalLine
+  } = analyticalSalesProfitParts();
   const itemsQuery = `
     SELECT TOP (20)
       d.Item_No AS itemId,
@@ -3388,6 +3405,188 @@ export async function analyticsDailyProfit(filters = {}) {
     bestProfitItems: bestItems.recordset || [],
     worstProfitItems: worstItems.recordset || [],
     mostSoldItems: mostSold.recordset || []
+  };
+}
+
+export async function analyticsProfitSummary(filters = {}) {
+  const dateRange = analyticsDateRange(filters);
+  const dateFrom = formatDateInputValue(dateRange.fromDate);
+  const dateTo = formatDateInputValue(dateRange.toDate);
+  const bind = (request) => bindDateRange(request, dateRange);
+  const {
+    salesUnitInfo,
+    normalizedSalesValue,
+    normalizedCostValue,
+    validAnalyticalLine
+  } = analyticalSalesProfitParts();
+
+  const profitRowsFrom = `
+    FROM (
+      SELECT
+        CONVERT(CHAR(10), mr.Movementrestrictions_Date, 120) AS dateKey,
+        mr.User_No AS sellerId,
+        ISNULL(seller.Person_Name, N'ط؛ظٹط± ظ…ط­ط¯ط¯') AS sellerName,
+        mr.Movementrestrictions_No AS movementNo,
+        ${normalizedSalesValue} AS revenue,
+        CASE WHEN ${validAnalyticalLine} THEN ${normalizedCostValue} ELSE 0 END AS cost,
+        CASE WHEN ${validAnalyticalLine} THEN ${normalizedSalesValue} - ${normalizedCostValue} ELSE 0 END AS profit,
+        CASE WHEN ${validAnalyticalLine} THEN 0 ELSE 1 END AS unitRisk
+      FROM dbo.The_Details d
+      INNER JOIN dbo.The_Movementrestrictions mr ON mr.Movementrestrictions_No = d.Movementrestrictions_No
+      LEFT JOIN dbo.The_Persons seller ON seller.Person_No = mr.User_No
+      LEFT JOIN (${salesUnitInfo}) unitInfo ON unitInfo.Item_No = d.Item_No
+      WHERE mr.Account_No IN (1, 2)
+        AND ${dateRangeFilter('mr.Movementrestrictions_Date', dateRange)}
+    ) profitRows
+  `;
+
+  const summaryQuery = `
+    SELECT
+      ISNULL(SUM(revenue), 0) AS totalRevenue,
+      ISNULL(SUM(cost), 0) AS totalCost,
+      ISNULL(SUM(profit), 0) AS totalProfit,
+      COUNT(DISTINCT movementNo) AS movementCount,
+      COUNT(*) AS detailCount,
+      ISNULL(SUM(unitRisk), 0) AS unitRiskCount
+    ${profitRowsFrom}
+  `;
+
+  const dailyProfitQuery = `
+    SELECT
+      dateKey AS date,
+      ISNULL(SUM(revenue), 0) AS revenue,
+      ISNULL(SUM(cost), 0) AS cost,
+      ISNULL(SUM(profit), 0) AS profit,
+      COUNT(DISTINCT movementNo) AS movementCount,
+      COUNT(*) AS detailCount,
+      ISNULL(SUM(unitRisk), 0) AS unitRiskCount
+    ${profitRowsFrom}
+    GROUP BY dateKey
+    ORDER BY dateKey DESC
+  `;
+
+  const periodProfitQuery = `
+    SELECT
+      dateKey AS date,
+      sellerId,
+      sellerName,
+      ISNULL(SUM(revenue), 0) AS revenue,
+      ISNULL(SUM(cost), 0) AS cost,
+      ISNULL(SUM(profit), 0) AS profit,
+      COUNT(DISTINCT movementNo) AS movementCount,
+      COUNT(*) AS detailCount,
+      ISNULL(SUM(unitRisk), 0) AS unitRiskCount
+    ${profitRowsFrom}
+    GROUP BY dateKey, sellerId, sellerName
+    ORDER BY dateKey DESC, sellerName ASC
+  `;
+
+  const revenueDailyQuery = `
+    SELECT
+      CONVERT(CHAR(10), movementDate, 120) AS date,
+      ISNULL(SUM(amount), 0) AS revenue,
+      COUNT(*) AS movementCount
+    ${revenueRowsFrom(dateRange, {})}
+    GROUP BY CONVERT(CHAR(10), movementDate, 120)
+  `;
+
+  const revenuePeriodQuery = `
+    SELECT
+      CONVERT(CHAR(10), movementDate, 120) AS date,
+      sellerId,
+      sellerName,
+      ISNULL(SUM(amount), 0) AS revenue,
+      COUNT(*) AS movementCount
+    ${revenueRowsFrom(dateRange, {})}
+    GROUP BY CONVERT(CHAR(10), movementDate, 120), sellerId, sellerName
+  `;
+
+  const [summaryResult, dailyProfitResult, periodProfitResult, revenueDailyResult, revenuePeriodResult] = await Promise.all([
+    executeReadonlyQuery(summaryQuery, bind),
+    executeReadonlyQuery(dailyProfitQuery, bind),
+    executeReadonlyQuery(periodProfitQuery, bind),
+    executeReadonlyQuery(revenueDailyQuery, bind),
+    executeReadonlyQuery(revenuePeriodQuery, bind)
+  ]);
+
+  const revenueByDay = new Map((revenueDailyResult.recordset || []).map((row) => [row.date, row]));
+  const revenueByDayAndSeller = new Map((revenuePeriodResult.recordset || []).map((row) => [`${row.date}::${row.sellerId ?? ''}`, row]));
+  const profitByDayAndSeller = new Map((periodProfitResult.recordset || []).map((row) => [`${row.date}::${row.sellerId ?? ''}`, row]));
+  const periodKeys = new Set([
+    ...(periodProfitResult.recordset || []).map((row) => `${row.date}::${row.sellerId ?? ''}`),
+    ...(revenuePeriodResult.recordset || []).map((row) => `${row.date}::${row.sellerId ?? ''}`)
+  ]);
+  const periodsByDay = new Map();
+
+  for (const periodKey of periodKeys) {
+    const row = profitByDayAndSeller.get(periodKey) || {};
+    const revenueRow = revenueByDayAndSeller.get(periodKey) || {};
+    const date = row.date || revenueRow.date;
+    if (!date) continue;
+    const periods = periodsByDay.get(date) || [];
+    periods.push({
+      sellerId: row.sellerId ?? revenueRow.sellerId,
+      sellerName: row.sellerName || revenueRow.sellerName || 'ط؛ظٹط± ظ…ط­ط¯ط¯',
+      revenue: Number(revenueRow.revenue || 0),
+      flowRevenue: row.revenue || 0,
+      cost: row.cost || 0,
+      profit: row.profit || 0,
+      movementCount: row.movementCount || 0,
+      detailCount: row.detailCount || 0,
+      revenueMovementCount: revenueRow.movementCount || 0,
+      unitRiskCount: row.unitRiskCount || 0
+    });
+    periodsByDay.set(date, periods);
+  }
+
+  const dayKeys = new Set([
+    ...(dailyProfitResult.recordset || []).map((row) => row.date),
+    ...(revenueDailyResult.recordset || []).map((row) => row.date)
+  ]);
+  const profitByDay = new Map((dailyProfitResult.recordset || []).map((row) => [row.date, row]));
+  const days = Array.from(dayKeys)
+    .sort((left, right) => String(right).localeCompare(String(left)))
+    .map((date) => {
+      const profitRow = profitByDay.get(date) || {};
+      const revenueRow = revenueByDay.get(date) || {};
+      const periods = periodsByDay.get(date) || [];
+      const revenue = Number(revenueRow.revenue || 0);
+      const profit = Number(profitRow.profit || 0);
+      const cost = Number(profitRow.cost || 0);
+      return {
+        date,
+        revenue,
+        flowRevenue: profitRow.revenue || 0,
+        cost,
+        profit,
+        margin: revenue > 0 ? (profit / revenue) * 100 : null,
+        movementCount: profitRow.movementCount || 0,
+        detailCount: profitRow.detailCount || 0,
+        revenueMovementCount: revenueRow.movementCount || 0,
+        unitRiskCount: profitRow.unitRiskCount || 0,
+        periods
+      };
+    });
+
+  const summary = summaryResult.recordset?.[0] || {};
+  const totalRevenue = (revenueDailyResult.recordset || []).reduce((sum, row) => sum + Number(row.revenue || 0), 0);
+  const totalProfit = Number(summary.totalProfit || 0);
+
+  return {
+    dateFrom,
+    dateTo,
+    summary: {
+      totalRevenue,
+      flowRevenue: summary.totalRevenue || 0,
+      totalCost: summary.totalCost || 0,
+      totalProfit,
+      margin: totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : null,
+      movementCount: summary.movementCount || 0,
+      detailCount: summary.detailCount || 0,
+      revenueMovementCount: (revenueDailyResult.recordset || []).reduce((sum, row) => sum + Number(row.movementCount || 0), 0),
+      unitRiskCount: summary.unitRiskCount || 0
+    },
+    days
   };
 }
 
