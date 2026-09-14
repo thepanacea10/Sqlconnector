@@ -736,6 +736,14 @@ app.get(
 );
 
 app.get(
+  '/api/analytics/management-report',
+  asyncRoute(async (req, res) => {
+    const result = await almohasebProfile.analyticsManagementReport(req.query);
+    res.json({ success: true, profile: 'almohaseb', ...result });
+  })
+);
+
+app.get(
   '/api/analytics/alerts',
   asyncRoute(async (_req, res) => {
     const result = await almohasebProfile.analyticsAlerts();

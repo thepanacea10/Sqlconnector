@@ -4195,6 +4195,155 @@ export async function analyticsGoodsCapital() {
   };
 }
 
+function availableManagementMetric(key, title, value, extra = {}) {
+  return {
+    key,
+    title,
+    value: Number(value || 0),
+    status: 'available',
+    ...extra
+  };
+}
+
+function unavailableManagementMetric(key, title, reason, extra = {}) {
+  return {
+    key,
+    title,
+    value: null,
+    status: 'unavailable',
+    reason,
+    ...extra
+  };
+}
+
+function errorManagementMetric(key, title, error, extra = {}) {
+  return {
+    key,
+    title,
+    value: null,
+    status: 'error',
+    reason: error?.message || 'تعذر حساب المؤشر.',
+    ...extra
+  };
+}
+
+async function safeManagementMetric(key, title, run, extra = {}) {
+  try {
+    const metric = await run();
+    return { ...metric, key, title };
+  } catch (error) {
+    return errorManagementMetric(key, title, error, extra);
+  }
+}
+
+export async function analyticsManagementReport(filters = {}) {
+  const dateRange = analyticsDateRange(filters);
+  const dateFrom = formatDateInputValue(dateRange.fromDate);
+  const dateTo = formatDateInputValue(dateRange.toDate);
+
+  const inventoryCostPromise = safeManagementMetric('inventoryCost', 'رصيد البضاعة بالتكلفة', async () => {
+    const query = `
+      SELECT
+        ISNULL(SUM(
+          (ISNULL(idt.Item_Quantity, 0) - ISNULL(idt.Item_Reserved, 0))
+          * ISNULL(idt.Item_Cost, 0)
+          / CASE WHEN ISNULL(unitInfo.Unit_OldQuantity, 0) = 0 THEN 1 ELSE unitInfo.Unit_OldQuantity END
+        ), 0) AS value,
+        COUNT(DISTINCT idt.Item_No) AS itemCount
+      FROM dbo.The_ItemDetails idt
+      INNER JOIN dbo.The_Items i ON i.Item_No = idt.Item_No
+      LEFT JOIN (
+        SELECT
+          Item_No,
+          COALESCE(
+            MAX(CASE WHEN Default_Unit = 1 THEN Unit_OldQuantity ELSE NULL END),
+            MAX(Unit_OldQuantity),
+            1
+          ) AS Unit_OldQuantity
+        FROM dbo.The_Units
+        GROUP BY Item_No
+      ) unitInfo ON unitInfo.Item_No = idt.Item_No
+      WHERE ISNULL(i.Item_Status, 0) = 0
+    `;
+    const result = await executeReadonlyQuery(query);
+    const row = result.recordset?.[0] || {};
+    return availableManagementMetric('inventoryCost', 'رصيد البضاعة بالتكلفة', row.value, {
+      count: Number(row.itemCount || 0),
+      source: 'القيمة الحالية للمخزون بالتكلفة بعد تطبيع وحدات العبوة'
+    });
+  });
+
+  const debtorsPromise = safeManagementMetric('debtors', 'المدين', async () => {
+    const query = `
+      SELECT
+        ISNULL(SUM(CASE WHEN customerRows.currentBalance > 0 THEN customerRows.currentBalance ELSE 0 END), 0) AS value,
+        SUM(CASE WHEN customerRows.currentBalance > 0 THEN 1 ELSE 0 END) AS debtorCount
+      FROM (
+        SELECT
+          p.Person_No AS id,
+          ISNULL(invoices.total, 0) - ISNULL(outstanding.total, 0) AS currentBalance
+        FROM dbo.The_Persons p
+        ${customerBalanceApply}
+        WHERE p.Person_Kind = 2
+      ) customerRows
+    `;
+    const result = await executeReadonlyQuery(query);
+    const row = result.recordset?.[0] || {};
+    return availableManagementMetric('debtors', 'المدين', row.value, {
+      count: Number(row.debtorCount || 0),
+      source: 'تعريف أرصدة الزبائن الحالي في Flow'
+    });
+  });
+
+  const creditorsPromise = safeManagementMetric('creditors', 'الدائن', async () => {
+    const query = `
+      SELECT
+        ISNULL(SUM(CASE WHEN supplierRows.currentBalance < 0 THEN ABS(supplierRows.currentBalance) ELSE 0 END), 0) AS value,
+        SUM(CASE WHEN supplierRows.currentBalance < 0 THEN 1 ELSE 0 END) AS creditorCount
+      FROM (
+        SELECT
+          supplierRows.id,
+          ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS currentBalance
+        FROM (
+          SELECT p.Person_No AS id
+          FROM dbo.The_Persons p
+          WHERE p.Person_Kind = 3
+        ) supplierRows
+        ${supplierBalanceApply}
+      ) supplierRows
+    `;
+    const result = await executeReadonlyQuery(query);
+    const row = result.recordset?.[0] || {};
+    return availableManagementMetric('creditors', 'الدائن', row.value, {
+      count: Number(row.creditorCount || 0),
+      source: 'تعريف أرصدة الموردين الحالي في Flow'
+    });
+  });
+
+  const [inventoryCost, debtors, creditors] = await Promise.all([
+    inventoryCostPromise,
+    debtorsPromise,
+    creditorsPromise
+  ]);
+
+  return {
+    dateFrom,
+    dateTo,
+    generatedAt: new Date().toISOString(),
+    metrics: [
+      inventoryCost,
+      debtors,
+      creditors,
+      unavailableManagementMetric('cash', 'النقدية', 'لا يوجد مصدر نقدية حالي مثبت بدون خلطها بالإيراد أو المبيعات.', {
+        source: null
+      }),
+      unavailableManagementMetric('expenses', 'المصاريف', 'تصنيف المصاريف غير مثبت بما يكفي لتقرير إداري رسمي.', {
+        source: null
+      })
+    ]
+  };
+}
+
 export async function analyticsAlerts() {
   const [shortages, expiry, priceChanges] = await Promise.all([
     analyticsSmartShortages(),
