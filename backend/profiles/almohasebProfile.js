@@ -1078,11 +1078,12 @@ function reportInvoiceRows({ accountFilter, fallbackTypeLabel, personKind, filte
   const summaryQuery = `
     SELECT
       COUNT(1) AS movementCount,
+      COUNT(DISTINCT mr.Person_No) AS supplierCount,
       ISNULL(SUM(ISNULL(invoiceTotals.total, 0)), 0) AS totalAmount,
       CASE WHEN COUNT(1) = 0 THEN 0 ELSE ISNULL(SUM(ISNULL(invoiceTotals.total, 0)), 0) / COUNT(1) END AS averageAmount
     ${fromQuery}
   `;
-  return { rowsQuery, summaryQuery, bind: (request) => bindReportFilters(request, filters), paging };
+  return { rowsQuery, summaryQuery, fromQuery, bind: (request) => bindReportFilters(request, filters), paging };
 }
 
 async function runPagedReport(report) {
@@ -1098,12 +1099,61 @@ async function runPagedReport(report) {
 }
 
 export async function getPurchasesReport(filters = {}) {
-  return runPagedReport(reportInvoiceRows({
+  const report = reportInvoiceRows({
     accountFilter: `mr.Account_No IN (${purchaseAccountNumbers})`,
     fallbackTypeLabel: 'فاتورة شراء',
     personKind: 3,
     filters
-  }));
+  });
+  const dateRange = parseDateRange(filters);
+  const supplierPaymentsQuery = `
+    SELECT
+      ISNULL(SUM(ABS(ISNULL(ov.Value_paid, 0))), 0) AS totalAmount,
+      COUNT(*) AS movementCount
+    FROM dbo.The_Outstandingvalues ov
+    INNER JOIN dbo.The_Persons p ON p.Person_No = ov.Person_No
+    WHERE p.Person_Kind = 3
+      AND ${dateRangeFilter('ov.Date_paid', dateRange)}
+      AND ISNULL(ov.Value_paid, 0) <> 0
+  `;
+  const topSuppliersQuery = `
+    SELECT TOP (10)
+      mr.Person_No AS supplierId,
+      ISNULL(person.Person_Name, N'غير محدد') AS supplierName,
+      COUNT(1) AS movementCount,
+      ISNULL(SUM(ISNULL(invoiceTotals.total, 0)), 0) AS totalAmount
+    ${report.fromQuery}
+    GROUP BY mr.Person_No, ISNULL(person.Person_Name, N'غير محدد')
+    ORDER BY totalAmount DESC, movementCount DESC, supplierName ASC
+  `;
+  const dailyQuery = `
+    SELECT
+      CONVERT(CHAR(10), mr.Movementrestrictions_Date, 120) AS [date],
+      COUNT(1) AS movementCount,
+      COUNT(DISTINCT mr.Person_No) AS supplierCount,
+      ISNULL(SUM(ISNULL(invoiceTotals.total, 0)), 0) AS totalAmount
+    ${report.fromQuery}
+    GROUP BY CONVERT(CHAR(10), mr.Movementrestrictions_Date, 120)
+    ORDER BY [date] ASC
+  `;
+  const [paged, supplierPaymentsResult, topSuppliersResult, dailyResult] = await Promise.all([
+    runPagedReport(report),
+    executeReadonlyQuery(supplierPaymentsQuery, (request) => bindDateRange(request, dateRange)),
+    executeReadonlyQuery(topSuppliersQuery, report.bind),
+    executeReadonlyQuery(dailyQuery, report.bind)
+  ]);
+  const supplierPayments = supplierPaymentsResult.recordset?.[0] || { totalAmount: 0, movementCount: 0 };
+  return {
+    ...paged,
+    summary: {
+      ...paged.summary,
+      supplierPaymentTotal: Number(supplierPayments.totalAmount || 0),
+      supplierPaymentCount: Number(supplierPayments.movementCount || 0),
+      periodDifference: Number(paged.summary?.totalAmount || 0) - Number(supplierPayments.totalAmount || 0)
+    },
+    topSuppliers: topSuppliersResult.recordset || [],
+    daily: dailyResult.recordset || []
+  };
 }
 
 export async function getSalesReport(filters = {}) {
@@ -4320,10 +4370,43 @@ export async function analyticsManagementReport(filters = {}) {
     });
   });
 
-  const [inventoryCost, debtors, creditors] = await Promise.all([
+  const cashPromise = safeManagementMetric('cash', 'النقدية', async () => {
+    const revenueQuery = `
+      SELECT
+        ISNULL(SUM(amount), 0) AS revenueValue,
+        COUNT(*) AS revenueCount
+      ${revenueRowsFrom(dateRange, {})}
+    `;
+    const supplierPaymentsQuery = `
+      SELECT
+        ISNULL(SUM(ABS(ISNULL(ov.Value_paid, 0))), 0) AS supplierPaymentValue,
+        COUNT(*) AS supplierPaymentCount
+      FROM dbo.The_Outstandingvalues ov
+      INNER JOIN dbo.The_Persons p ON p.Person_No = ov.Person_No
+      WHERE p.Person_Kind = 3
+        AND ${dateRangeFilter('ov.Date_paid', dateRange)}
+        AND ISNULL(ov.Value_paid, 0) <> 0
+    `;
+    const [revenueResult, supplierPaymentsResult] = await Promise.all([
+      executeReadonlyQuery(revenueQuery, (request) => bindDateRange(request, dateRange)),
+      executeReadonlyQuery(supplierPaymentsQuery, (request) => bindDateRange(request, dateRange))
+    ]);
+    const revenueRow = revenueResult.recordset?.[0] || {};
+    const supplierPaymentsRow = supplierPaymentsResult.recordset?.[0] || {};
+    const revenueValue = Number(revenueRow.revenueValue || 0);
+    const supplierPaymentValue = Number(supplierPaymentsRow.supplierPaymentValue || 0);
+
+    return availableManagementMetric('cash', 'النقدية', revenueValue - supplierPaymentValue, {
+      count: Number(revenueRow.revenueCount || 0) + Number(supplierPaymentsRow.supplierPaymentCount || 0),
+      source: 'إيراد الفترة الفعلي ناقص سدادات الموردين لنفس الفترة'
+    });
+  });
+
+  const [inventoryCost, debtors, creditors, cash] = await Promise.all([
     inventoryCostPromise,
     debtorsPromise,
-    creditorsPromise
+    creditorsPromise,
+    cashPromise
   ]);
 
   return {
@@ -4334,9 +4417,7 @@ export async function analyticsManagementReport(filters = {}) {
       inventoryCost,
       debtors,
       creditors,
-      unavailableManagementMetric('cash', 'النقدية', 'لا يوجد مصدر نقدية حالي مثبت بدون خلطها بالإيراد أو المبيعات.', {
-        source: null
-      }),
+      cash,
       unavailableManagementMetric('expenses', 'المصاريف', 'تصنيف المصاريف غير مثبت بما يكفي لتقرير إداري رسمي.', {
         source: null
       })
