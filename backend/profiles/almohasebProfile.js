@@ -1182,11 +1182,12 @@ function paymentReportRows({ accountFilter, personLabel, filters = {} }) {
   const dateFilter = dateRangeFilter('ov.Date_paid', dateRange);
   const groupedFromQuery = `
     FROM (
-      SELECT
-        MIN(grouped.Outstandingvalues_No) AS paymentRootNo,
-        MIN(grouped.Date_paid) AS [date],
-        MAX(grouped.personName) AS personName,
-        ABS(SUM(ISNULL(grouped.Value_paid, 0))) AS amount,
+        SELECT
+          grouped.Person_No AS personNo,
+          MIN(grouped.Outstandingvalues_No) AS paymentRootNo,
+          MIN(grouped.Date_paid) AS [date],
+          MAX(grouped.personName) AS personName,
+          ABS(SUM(ISNULL(grouped.Value_paid, 0))) AS amount,
         ISNULL(MAX(NULLIF(grouped.Type_Payment, N'')), N'غير محدد') AS paymentMethod,
         MAX(grouped.Movementrestrictions_No) AS movementNo,
         ISNULL(MAX(NULLIF(grouped.Comment, N'')), N'') AS notes
@@ -1236,6 +1237,7 @@ function paymentReportRows({ accountFilter, personLabel, filters = {} }) {
       SELECT
         ROW_NUMBER() OVER (ORDER BY paymentRows.[date] DESC, paymentRows.paymentRootNo DESC) AS rowNo,
         paymentRows.[date],
+        paymentRows.personNo,
         paymentRows.personName,
         paymentRows.amount,
         paymentRows.paymentMethod,
@@ -1251,27 +1253,64 @@ function paymentReportRows({ accountFilter, personLabel, filters = {} }) {
   const summaryQuery = `
     SELECT
       COUNT(1) AS movementCount,
+      COUNT(DISTINCT paymentRows.personNo) AS personCount,
       ISNULL(SUM(paymentRows.amount), 0) AS totalAmount,
       CASE WHEN COUNT(1) = 0 THEN 0 ELSE ISNULL(SUM(paymentRows.amount), 0) / COUNT(1) END AS averageAmount
     ${groupedFromQuery}
   `;
-  return { rowsQuery, summaryQuery, bind: (request) => bindReportFilters(request, filters), paging };
+  return { rowsQuery, summaryQuery, groupedFromQuery, bind: (request) => bindReportFilters(request, filters), paging };
 }
 
 export async function getSupplierPaymentsReport(filters = {}) {
-  return runPagedReport(paymentReportRows({
+  const report = paymentReportRows({
     accountFilter: `ov.Account_No IN (${purchaseAccountNumbers})`,
     personLabel: 'المورد',
     filters
-  }));
+  });
+  const topPartiesQuery = `
+    SELECT TOP (1)
+      paymentRows.personNo AS personId,
+      paymentRows.personName,
+      COUNT(1) AS movementCount,
+      ISNULL(SUM(paymentRows.amount), 0) AS totalAmount
+    ${report.groupedFromQuery}
+    GROUP BY paymentRows.personNo, paymentRows.personName
+    ORDER BY totalAmount DESC, movementCount DESC, personName ASC
+  `;
+  const [paged, topPartiesResult] = await Promise.all([
+    runPagedReport(report),
+    executeReadonlyQuery(topPartiesQuery, report.bind)
+  ]);
+  return {
+    ...paged,
+    topParties: topPartiesResult.recordset || []
+  };
 }
 
 export async function getCustomerReceiptsReport(filters = {}) {
-  return runPagedReport(paymentReportRows({
+  const report = paymentReportRows({
     accountFilter: 'ISNULL(person.Person_Kind, 0) = 2',
     personLabel: 'العميل',
     filters
-  }));
+  });
+  const topPartiesQuery = `
+    SELECT TOP (1)
+      paymentRows.personNo AS personId,
+      paymentRows.personName,
+      COUNT(1) AS movementCount,
+      ISNULL(SUM(paymentRows.amount), 0) AS totalAmount
+    ${report.groupedFromQuery}
+    GROUP BY paymentRows.personNo, paymentRows.personName
+    ORDER BY totalAmount DESC, movementCount DESC, personName ASC
+  `;
+  const [paged, topPartiesResult] = await Promise.all([
+    runPagedReport(report),
+    executeReadonlyQuery(topPartiesQuery, report.bind)
+  ]);
+  return {
+    ...paged,
+    topParties: topPartiesResult.recordset || []
+  };
 }
 
 export async function getItemMovementReport(filters = {}) {
