@@ -429,30 +429,109 @@ const customerBalanceApply = `
   ) lastMovement
 `;
 
-export async function getCustomers({ search }) {
+function customerBalanceFilter(balanceFilter) {
+  const normalized = String(balanceFilter || 'nonzero').toLowerCase();
+  if (normalized === 'all') return { filter: 'all', sql: '1 = 1' };
+  if (normalized === 'debtors' || normalized === 'positive') return { filter: 'debtors', sql: 'customerRows.currentBalance > 0' };
+  if (normalized === 'zero') return { filter: 'zero', sql: 'customerRows.currentBalance = 0' };
+  return { filter: 'nonzero', sql: 'customerRows.currentBalance <> 0' };
+}
+
+function parseAccountPage({ page, pageSize } = {}) {
+  const safePage = Math.max(1, parseSafeInteger(page, 1) || 1);
+  const requestedPageSize = parseSafeInteger(pageSize, 50) || 50;
+  const safePageSize = Math.min(Math.max(requestedPageSize, 10), 500);
+  return {
+    page: safePage,
+    pageSize: safePageSize,
+    rowStart: ((safePage - 1) * safePageSize) + 1,
+    rowEnd: safePage * safePageSize
+  };
+}
+
+export async function getCustomers({ search, balanceFilter, page, pageSize } = {}) {
   const term = searchText(search);
-  const query = `
-    SELECT TOP (80)
-      p.Person_No AS id,
-      p.Person_Name AS name,
-      p.Person_tel AS phone,
-      p.Person_Add AS address,
-      ISNULL(invoices.total, 0) - ISNULL(outstanding.total, 0) AS currentBalance,
-      lastMovement.[date] AS lastTransactionDate,
-      lastMovement.amount AS lastTransactionAmount
-    FROM dbo.The_Persons p
-    ${customerBalanceApply}
-    WHERE p.Person_Kind = 2
-      AND (
-        @search = N''
-        OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
-        OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
-      )
-    ORDER BY p.Person_Name ASC
+  const filter = customerBalanceFilter(balanceFilter);
+  const paging = parseAccountPage({ page, pageSize });
+  const customerRows = `
+    FROM (
+      SELECT
+        p.Person_No AS id,
+        p.Person_Name AS name,
+        p.Person_tel AS phone,
+        p.Person_Add AS address,
+        ISNULL(invoices.total, 0) - ISNULL(outstanding.total, 0) AS currentBalance,
+        lastMovement.[date] AS lastTransactionDate,
+        lastMovement.amount AS lastTransactionAmount
+      FROM dbo.The_Persons p
+      ${customerBalanceApply}
+      WHERE p.Person_Kind = 2
+        AND (
+          @search = N''
+          OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
+          OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
+          OR CONVERT(NVARCHAR(50), p.Person_No) LIKE @searchLike
+        )
+    ) customerRows
+    WHERE ${filter.sql}
   `;
 
-  const result = await executeReadonlyQuery(query, (request) => bindSearch(request, term));
-  return result.recordset || [];
+  const rowsQuery = `
+    SELECT *
+    FROM (
+      SELECT
+        customerRows.*,
+        ROW_NUMBER() OVER (
+          ORDER BY
+            CASE WHEN customerRows.currentBalance > 0 THEN 0 WHEN customerRows.currentBalance < 0 THEN 1 ELSE 2 END ASC,
+            CASE WHEN customerRows.currentBalance > 0 THEN customerRows.currentBalance ELSE NULL END DESC,
+            ABS(customerRows.currentBalance) DESC,
+            customerRows.name ASC
+        ) AS rowNumber
+      ${customerRows}
+    ) pagedRows
+    WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
+    ORDER BY pagedRows.rowNumber ASC
+  `;
+
+  const totalsQuery = `
+    SELECT
+      COUNT(1) AS totalCount,
+      ISNULL(SUM(customerRows.currentBalance), 0) AS totalBalance,
+      SUM(CASE WHEN customerRows.currentBalance > 0 THEN 1 ELSE 0 END) AS positiveCount,
+      ISNULL(SUM(CASE WHEN customerRows.currentBalance > 0 THEN customerRows.currentBalance ELSE 0 END), 0) AS positiveBalance,
+      SUM(CASE WHEN customerRows.currentBalance < 0 THEN 1 ELSE 0 END) AS negativeCount,
+      ISNULL(SUM(CASE WHEN customerRows.currentBalance < 0 THEN customerRows.currentBalance ELSE 0 END), 0) AS negativeBalance,
+      SUM(CASE WHEN customerRows.currentBalance = 0 THEN 1 ELSE 0 END) AS zeroCount
+    ${customerRows}
+  `;
+
+  const bindPagedCustomers = (request) => {
+    bindSearch(request, term);
+    request.input('rowStart', sql.Int, paging.rowStart);
+    request.input('rowEnd', sql.Int, paging.rowEnd);
+  };
+
+  const [rowsResult, totalsResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, bindPagedCustomers),
+    executeReadonlyQuery(totalsQuery, (request) => bindSearch(request, term))
+  ]);
+  const totals = totalsResult.recordset?.[0] || {};
+  const totalCount = Number(totals.totalCount || 0);
+  return {
+    rows: rowsResult.recordset || [],
+    totalCount,
+    page: paging.page,
+    pageSize: paging.pageSize,
+    hasMore: paging.page * paging.pageSize < totalCount,
+    balanceFilter: filter.filter,
+    totalBalance: Number(totals.totalBalance || 0),
+    positiveCount: Number(totals.positiveCount || 0),
+    positiveBalance: Number(totals.positiveBalance || 0),
+    negativeCount: Number(totals.negativeCount || 0),
+    negativeBalance: Number(totals.negativeBalance || 0),
+    zeroCount: Number(totals.zeroCount || 0)
+  };
 }
 
 export async function getSuppliers({ search }) {

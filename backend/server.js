@@ -392,8 +392,13 @@ app.post(
 app.get(
   '/api/customers',
   asyncRoute(async (req, res) => {
-    const customers = await almohasebProfile.getCustomers({ search: req.query.search });
-    res.json({ success: true, profile: 'almohaseb', customers });
+    const result = await almohasebProfile.getCustomers({
+      search: req.query.search,
+      balanceFilter: req.query.balanceFilter,
+      page: req.query.page,
+      pageSize: req.query.pageSize
+    });
+    res.json({ success: true, profile: 'almohaseb', customers: result.rows, ...result });
   })
 );
 
