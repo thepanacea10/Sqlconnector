@@ -405,8 +405,13 @@ app.get(
 app.get(
   '/api/suppliers',
   asyncRoute(async (req, res) => {
-    const suppliers = await almohasebProfile.getSuppliers({ search: req.query.search });
-    res.json({ success: true, profile: 'almohaseb', suppliers });
+    const result = await almohasebProfile.getSuppliers({
+      search: req.query.search,
+      balanceFilter: req.query.balanceFilter,
+      page: req.query.page,
+      pageSize: req.query.pageSize
+    });
+    res.json({ success: true, profile: 'almohaseb', suppliers: result.rows, ...result });
   })
 );
 

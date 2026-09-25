@@ -357,15 +357,17 @@ const supplierBalanceApply = `
       CAST(NULL AS money) AS lastAmount
     FROM dbo.The_Outstandingvalues ov
     WHERE ov.Person_No = supplierRows.id
+      AND ov.Account_No IN (${purchaseAccountNumbers})
   ) supplierPayments
 `;
 
 const customerBalanceApply = `
   OUTER APPLY (
     SELECT
-      SUM(ISNULL(invoiceTotals.total, 0)) AS total,
+      SUM(ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1)) AS total,
       MAX(mr.Movementrestrictions_Date) AS lastDate
     FROM dbo.The_Movementrestrictions mr
+    INNER JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
     OUTER APPLY (
       SELECT SUM(
         ISNULL(d.Charge_Value, 0)
@@ -383,7 +385,7 @@ const customerBalanceApply = `
       WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
     ) invoiceTotals
     WHERE mr.Person_No = p.Person_No
-      AND mr.Account_No = 2
+      AND mr.Account_No IN (2, 4)
   ) invoices
   OUTER APPLY (
     SELECT
@@ -391,6 +393,7 @@ const customerBalanceApply = `
       MAX(ov.Date_paid) AS lastDate
     FROM dbo.The_Outstandingvalues ov
     WHERE ov.Person_No = p.Person_No
+      AND ov.Account_No IN (2, 4)
   ) outstanding
   OUTER APPLY (
     SELECT TOP (1)
@@ -418,11 +421,12 @@ const customerBalanceApply = `
         WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
       ) invoiceTotals
       WHERE mr.Person_No = p.Person_No
-        AND mr.Account_No = 2
+        AND mr.Account_No IN (2, 4)
       UNION ALL
       SELECT ov.Date_paid AS [date], -ISNULL(ov.Value_paid, 0) AS amount
       FROM dbo.The_Outstandingvalues ov
       WHERE ov.Person_No = p.Person_No
+        AND ov.Account_No IN (2, 4)
     ) ledgerRow
     WHERE ledgerRow.[date] IS NOT NULL
     ORDER BY ledgerRow.[date] DESC
@@ -465,8 +469,7 @@ export async function getCustomers({ search, balanceFilter, page, pageSize } = {
         lastMovement.amount AS lastTransactionAmount
       FROM dbo.The_Persons p
       ${customerBalanceApply}
-      WHERE p.Person_Kind = 2
-        AND (
+      WHERE (
           @search = N''
           OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
           OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
@@ -534,43 +537,102 @@ export async function getCustomers({ search, balanceFilter, page, pageSize } = {
   };
 }
 
-export async function getSuppliers({ search }) {
+function supplierBalanceFilter(balanceFilter) {
+  const normalized = String(balanceFilter || 'nonzero').toLowerCase();
+  if (normalized === 'all') return { filter: 'all', sql: '1 = 1' };
+  if (normalized === 'creditors' || normalized === 'payables') return { filter: 'creditors', sql: 'supplierRows.currentBalance < 0' };
+  if (normalized === 'zero') return { filter: 'zero', sql: 'supplierRows.currentBalance = 0' };
+  return { filter: 'nonzero', sql: 'supplierRows.currentBalance <> 0' };
+}
+
+export async function getSuppliers({ search, balanceFilter, page, pageSize } = {}) {
   const term = searchText(search);
-  const query = `
-    SELECT TOP (200)
-      supplierRows.id,
-      supplierRows.name,
-      supplierRows.phone,
-      supplierRows.address,
-      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS currentBalance,
-      CASE
-        WHEN ISNULL(supplierMovements.lastDate, '19000101') >= ISNULL(supplierPayments.lastDate, '19000101') THEN supplierMovements.lastDate
-        ELSE supplierPayments.lastDate
-      END AS lastTransactionDate,
-      supplierPayments.lastAmount AS lastTransactionAmount
+  const filter = supplierBalanceFilter(balanceFilter);
+  const paging = parseAccountPage({ page, pageSize });
+  const supplierRows = `
     FROM (
       SELECT
         p.Person_No AS id,
         p.Person_Name AS name,
         p.Person_tel AS phone,
-        p.Person_Add AS address
+        p.Person_Add AS address,
+        ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) AS currentBalance,
+        CASE
+          WHEN ISNULL(supplierMovements.lastDate, '19000101') >= ISNULL(supplierPayments.lastDate, '19000101') THEN supplierMovements.lastDate
+          ELSE supplierPayments.lastDate
+        END AS lastTransactionDate,
+        supplierPayments.lastAmount AS lastTransactionAmount
       FROM dbo.The_Persons p
-      WHERE p.Person_Kind = 3
-        AND (
-          @search = N''
-          OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
-          OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
-        )
+      CROSS APPLY (
+        SELECT p.Person_No AS id
       ) supplierRows
-    ${supplierBalanceApply}
-    ORDER BY
-      CASE WHEN ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) = 0 THEN 1 ELSE 0 END ASC,
-      ISNULL(supplierMovements.total, 0) - ISNULL(supplierPayments.total, 0) ASC,
-      supplierRows.name ASC
+      ${supplierBalanceApply}
+      WHERE (
+        @search = N''
+        OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
+        OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
+        OR CONVERT(NVARCHAR(50), p.Person_No) LIKE @searchLike
+      )
+    ) supplierRows
+    WHERE ${filter.sql}
   `;
 
-  const result = await executeReadonlyQuery(query, (request) => bindSearch(request, term));
-  return result.recordset || [];
+  const rowsQuery = `
+    SELECT *
+    FROM (
+      SELECT
+        supplierRows.*,
+        ROW_NUMBER() OVER (
+          ORDER BY
+            CASE WHEN supplierRows.currentBalance < 0 THEN 0 WHEN supplierRows.currentBalance > 0 THEN 1 ELSE 2 END ASC,
+            CASE WHEN supplierRows.currentBalance < 0 THEN ABS(supplierRows.currentBalance) ELSE NULL END DESC,
+            ABS(supplierRows.currentBalance) DESC,
+            supplierRows.name ASC
+        ) AS rowNumber
+      ${supplierRows}
+    ) pagedRows
+    WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
+    ORDER BY pagedRows.rowNumber ASC
+  `;
+
+  const totalsQuery = `
+    SELECT
+      COUNT(1) AS totalCount,
+      ISNULL(SUM(supplierRows.currentBalance), 0) AS totalBalance,
+      SUM(CASE WHEN supplierRows.currentBalance < 0 THEN 1 ELSE 0 END) AS negativeCount,
+      ISNULL(SUM(CASE WHEN supplierRows.currentBalance < 0 THEN supplierRows.currentBalance ELSE 0 END), 0) AS negativeBalance,
+      SUM(CASE WHEN supplierRows.currentBalance > 0 THEN 1 ELSE 0 END) AS positiveCount,
+      ISNULL(SUM(CASE WHEN supplierRows.currentBalance > 0 THEN supplierRows.currentBalance ELSE 0 END), 0) AS positiveBalance,
+      SUM(CASE WHEN supplierRows.currentBalance = 0 THEN 1 ELSE 0 END) AS zeroCount
+    ${supplierRows}
+  `;
+
+  const bindPagedSuppliers = (request) => {
+    bindSearch(request, term);
+    request.input('rowStart', sql.Int, paging.rowStart);
+    request.input('rowEnd', sql.Int, paging.rowEnd);
+  };
+
+  const [rowsResult, totalsResult] = await Promise.all([
+    executeReadonlyQuery(rowsQuery, bindPagedSuppliers),
+    executeReadonlyQuery(totalsQuery, (request) => bindSearch(request, term))
+  ]);
+  const totals = totalsResult.recordset?.[0] || {};
+  const totalCount = Number(totals.totalCount || 0);
+  return {
+    rows: rowsResult.recordset || [],
+    totalCount,
+    page: paging.page,
+    pageSize: paging.pageSize,
+    hasMore: paging.page * paging.pageSize < totalCount,
+    balanceFilter: filter.filter,
+    totalBalance: Number(totals.totalBalance || 0),
+    positiveCount: Number(totals.positiveCount || 0),
+    positiveBalance: Number(totals.positiveBalance || 0),
+    negativeCount: Number(totals.negativeCount || 0),
+    negativeBalance: Number(totals.negativeBalance || 0),
+    zeroCount: Number(totals.zeroCount || 0)
+  };
 }
 
 export async function getSupplierInvoices(id) {
@@ -774,7 +836,6 @@ export async function getSupplierDiagnostics(id) {
     ) supplierRows
     ${supplierBalanceApply}
     WHERE p.Person_No = @id
-      AND p.Person_Kind = 3
   `;
 
   const result = await executeReadonlyQuery(query, (request) => bindId(request, id));
@@ -790,7 +851,6 @@ export async function getCustomer(id) {
       p.Person_Add AS address
     FROM dbo.The_Persons p
     WHERE p.Person_No = @id
-      AND p.Person_Kind = 2
   `;
 
   const result = await executeReadonlyQuery(query, (request) => bindId(request, id));
@@ -827,9 +887,10 @@ export async function getCustomerInvoices(id) {
       SELECT SUM(ISNULL(ov.Value_paid, 0)) AS paid
       FROM dbo.The_Outstandingvalues ov
       WHERE ov.Movementrestrictions_No = mr.Movementrestrictions_No
+        AND ov.Account_No IN (2, 4)
     ) payments
     WHERE mr.Person_No = @id
-      AND mr.Account_No = 2
+      AND mr.Account_No IN (2, 4)
     ORDER BY mr.Movementrestrictions_Date DESC, mr.Movementrestrictions_No DESC
   `;
 
@@ -859,6 +920,7 @@ export async function getCustomerReceipts(id) {
         ov.Computer_Name
       FROM dbo.The_Outstandingvalues ov
       WHERE ov.Person_No = @id
+        AND ov.Account_No IN (2, 4)
     ) receiptRows
     GROUP BY
       receiptRows.Person_No,
@@ -888,12 +950,13 @@ export async function getCustomerStatement(id, options = {}) {
     SELECT
       mr.Movementrestrictions_Date AS [date],
       N'فاتورة رقم ' + CONVERT(NVARCHAR(30), mr.Movementrestrictions_No) AS description,
-      ISNULL(invoiceTotals.total, 0) AS debit,
-      CAST(0 AS money) AS credit,
+      CASE WHEN ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) > 0 THEN ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) ELSE 0 END AS debit,
+      CASE WHEN ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1) < 0 THEN ABS(ISNULL(invoiceTotals.total, 0) * ISNULL(acc.Account_kind, 1)) ELSE 0 END AS credit,
       CAST(1 AS int) AS sortOrder,
       mr.Movementrestrictions_No AS refNo,
       N'sales-invoice' AS rowType
     FROM dbo.The_Movementrestrictions mr
+    INNER JOIN dbo.The_Account acc ON acc.Account_No = mr.Account_No
     OUTER APPLY (
       SELECT SUM(
         ISNULL(d.Charge_Value, 0)
@@ -911,15 +974,15 @@ export async function getCustomerStatement(id, options = {}) {
       WHERE d.Movementrestrictions_No = mr.Movementrestrictions_No
     ) invoiceTotals
     WHERE mr.Person_No = @id
-      AND mr.Account_No = 2
+      AND mr.Account_No IN (2, 4)
       ${invoiceArchiveFilter}
       ${invoiceDateFilter}
     UNION ALL
     SELECT
       paymentRows.[date],
       N'دفعة رقم ' + CONVERT(NVARCHAR(30), paymentRows.paymentRootNo) AS description,
-      CAST(0 AS money) AS debit,
-      paymentRows.amount AS credit,
+      CASE WHEN paymentRows.amount < 0 THEN ABS(paymentRows.amount) ELSE 0 END AS debit,
+      CASE WHEN paymentRows.amount > 0 THEN paymentRows.amount ELSE 0 END AS credit,
       CAST(2 AS int) AS sortOrder,
       paymentRows.paymentRootNo AS refNo,
       N'payment' AS rowType
@@ -944,6 +1007,7 @@ export async function getCustomerStatement(id, options = {}) {
         FROM dbo.The_Outstandingvalues ov
         LEFT JOIN dbo.The_Movementrestrictions linkedInvoice ON linkedInvoice.Movementrestrictions_No = ov.Movementrestrictions_No
         WHERE ov.Person_No = @id
+          AND ov.Account_No IN (2, 4)
           ${paymentArchiveFilter}
           ${paymentDateFilter}
       ) grouped
@@ -1368,7 +1432,7 @@ export async function getSupplierPaymentsReport(filters = {}) {
 
 export async function getCustomerReceiptsReport(filters = {}) {
   const report = paymentReportRows({
-    accountFilter: 'ISNULL(person.Person_Kind, 0) = 2',
+    accountFilter: 'ov.Account_No IN (2, 4)',
     personLabel: 'العميل',
     filters
   });
@@ -4452,7 +4516,6 @@ export async function analyticsManagementReport(filters = {}) {
           ISNULL(invoices.total, 0) - ISNULL(outstanding.total, 0) AS currentBalance
         FROM dbo.The_Persons p
         ${customerBalanceApply}
-        WHERE p.Person_Kind = 2
       ) customerRows
     `;
     const result = await executeReadonlyQuery(query);
@@ -4475,7 +4538,6 @@ export async function analyticsManagementReport(filters = {}) {
         FROM (
           SELECT p.Person_No AS id
           FROM dbo.The_Persons p
-          WHERE p.Person_Kind = 3
         ) supplierRows
         ${supplierBalanceApply}
       ) supplierRows
@@ -4500,9 +4562,8 @@ export async function analyticsManagementReport(filters = {}) {
         ISNULL(SUM(ABS(ISNULL(ov.Value_paid, 0))), 0) AS supplierPaymentValue,
         COUNT(*) AS supplierPaymentCount
       FROM dbo.The_Outstandingvalues ov
-      INNER JOIN dbo.The_Persons p ON p.Person_No = ov.Person_No
-      WHERE p.Person_Kind = 3
-        AND ${dateRangeFilter('ov.Date_paid', dateRange)}
+      WHERE ${dateRangeFilter('ov.Date_paid', dateRange)}
+        AND ov.Account_No IN (${purchaseAccountNumbers})
         AND ISNULL(ov.Value_paid, 0) <> 0
     `;
     const [revenueResult, supplierPaymentsResult] = await Promise.all([
