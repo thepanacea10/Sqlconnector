@@ -433,6 +433,34 @@ const customerBalanceApply = `
   ) lastMovement
 `;
 
+// Activity dates do not change balances or the account list filters.
+function accountActivityApply(kind) {
+  const customer = kind === 'customer';
+  const accountNo = customer ? 2 : 7;
+  return `
+    LEFT JOIN (
+      SELECT mr.Person_No, MAX(mr.Movementrestrictions_Date) AS lastTradeDate
+      FROM dbo.The_Movementrestrictions mr
+      WHERE mr.Account_No = ${accountNo}
+        AND ISNULL(mr.Case_Invoice, 0) = 0
+      GROUP BY mr.Person_No
+    ) tradeActivity ON tradeActivity.Person_No = pagedRows.id
+    LEFT JOIN (
+      SELECT ov.Person_No, MAX(ov.Date_paid) AS lastPaymentDate
+      FROM dbo.The_Outstandingvalues ov
+      LEFT JOIN dbo.The_Movementrestrictions linkedInvoice
+        ON linkedInvoice.Movementrestrictions_No = ov.Movementrestrictions_No
+      WHERE ov.Account_No = ${accountNo}
+        AND ISNULL(ov.Value_paid, 0) ${customer ? '>' : '<'} 0
+        AND (linkedInvoice.Movementrestrictions_No IS NULL OR (
+          linkedInvoice.Person_No = ov.Person_No AND linkedInvoice.Account_No = ${accountNo}
+          AND ISNULL(linkedInvoice.Case_Invoice, 0) = 0
+        ))
+      GROUP BY ov.Person_No
+    ) paymentActivity ON paymentActivity.Person_No = pagedRows.id
+  `;
+}
+
 function customerBalanceFilter(balanceFilter) {
   const normalized = String(balanceFilter || 'nonzero').toLowerCase();
   if (normalized === 'all') return { filter: 'all', sql: '1 = 1' };
@@ -480,7 +508,7 @@ export async function getCustomers({ search, balanceFilter, page, pageSize } = {
   `;
 
   const rowsQuery = `
-    SELECT *
+    SELECT pagedRows.*, tradeActivity.lastTradeDate AS lastSaleDate, paymentActivity.lastPaymentDate AS lastCollectionDate
     FROM (
       SELECT
         customerRows.*,
@@ -493,6 +521,7 @@ export async function getCustomers({ search, balanceFilter, page, pageSize } = {
         ) AS rowNumber
       ${customerRows}
     ) pagedRows
+    ${accountActivityApply('customer')}
     WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
     ORDER BY pagedRows.rowNumber ASC
   `;
@@ -578,7 +607,7 @@ export async function getSuppliers({ search, balanceFilter, page, pageSize } = {
   `;
 
   const rowsQuery = `
-    SELECT *
+    SELECT pagedRows.*, tradeActivity.lastTradeDate AS lastPurchaseDate, paymentActivity.lastPaymentDate
     FROM (
       SELECT
         supplierRows.*,
@@ -591,6 +620,7 @@ export async function getSuppliers({ search, balanceFilter, page, pageSize } = {
         ) AS rowNumber
       ${supplierRows}
     ) pagedRows
+    ${accountActivityApply('supplier')}
     WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
     ORDER BY pagedRows.rowNumber ASC
   `;
