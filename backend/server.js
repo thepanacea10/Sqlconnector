@@ -395,6 +395,7 @@ app.get(
     const result = await almohasebProfile.getCustomers({
       search: req.query.search,
       balanceFilter: req.query.balanceFilter,
+      sort: req.query.sort,
       page: req.query.page,
       pageSize: req.query.pageSize
     });

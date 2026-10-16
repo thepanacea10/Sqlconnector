@@ -434,7 +434,7 @@ const customerBalanceApply = `
 `;
 
 // Activity dates do not change balances or the account list filters.
-function accountActivityApply(kind) {
+function accountActivityApply(kind, accountAlias = 'pagedRows') {
   const customer = kind === 'customer';
   const accountNo = customer ? 2 : 7;
   return `
@@ -444,7 +444,7 @@ function accountActivityApply(kind) {
       WHERE mr.Account_No = ${accountNo}
         AND ISNULL(mr.Case_Invoice, 0) = 0
       GROUP BY mr.Person_No
-    ) tradeActivity ON tradeActivity.Person_No = pagedRows.id
+    ) tradeActivity ON tradeActivity.Person_No = ${accountAlias}.id
     LEFT JOIN (
       SELECT ov.Person_No, MAX(ov.Date_paid) AS lastPaymentDate
       FROM dbo.The_Outstandingvalues ov
@@ -457,7 +457,7 @@ function accountActivityApply(kind) {
           AND ISNULL(linkedInvoice.Case_Invoice, 0) = 0
         ))
       GROUP BY ov.Person_No
-    ) paymentActivity ON paymentActivity.Person_No = pagedRows.id
+    ) paymentActivity ON paymentActivity.Person_No = ${accountAlias}.id
   `;
 }
 
@@ -481,10 +481,17 @@ function parseAccountPage({ page, pageSize } = {}) {
   };
 }
 
-export async function getCustomers({ search, balanceFilter, page, pageSize } = {}) {
+export async function getCustomers({ search, balanceFilter, sort, page, pageSize } = {}) {
   const term = searchText(search);
   const filter = customerBalanceFilter(balanceFilter);
   const paging = parseAccountPage({ page, pageSize });
+  const collectionOrder = sort === 'last-collection-newest' ? 'DESC' : sort === 'last-collection-oldest' ? 'ASC' : null;
+  const orderBy = collectionOrder
+    ? `CASE WHEN paymentActivity.lastPaymentDate IS NULL THEN 1 ELSE 0 END ASC,
+       paymentActivity.lastPaymentDate ${collectionOrder}, accountRows.name ASC, accountRows.id ASC`
+    : `CASE WHEN accountRows.currentBalance > 0 THEN 0 WHEN accountRows.currentBalance < 0 THEN 1 ELSE 2 END ASC,
+       CASE WHEN accountRows.currentBalance > 0 THEN accountRows.currentBalance ELSE NULL END DESC,
+       ABS(accountRows.currentBalance) DESC, accountRows.name ASC, accountRows.id ASC`;
   const customerRows = `
     FROM (
       SELECT
@@ -508,20 +515,19 @@ export async function getCustomers({ search, balanceFilter, page, pageSize } = {
   `;
 
   const rowsQuery = `
-    SELECT pagedRows.*, tradeActivity.lastTradeDate AS lastSaleDate, paymentActivity.lastPaymentDate AS lastCollectionDate
+    SELECT pagedRows.*
     FROM (
       SELECT
-        customerRows.*,
-        ROW_NUMBER() OVER (
-          ORDER BY
-            CASE WHEN customerRows.currentBalance > 0 THEN 0 WHEN customerRows.currentBalance < 0 THEN 1 ELSE 2 END ASC,
-            CASE WHEN customerRows.currentBalance > 0 THEN customerRows.currentBalance ELSE NULL END DESC,
-            ABS(customerRows.currentBalance) DESC,
-            customerRows.name ASC
-        ) AS rowNumber
-      ${customerRows}
+        accountRows.*,
+        tradeActivity.lastTradeDate AS lastSaleDate,
+        paymentActivity.lastPaymentDate AS lastCollectionDate,
+        ROW_NUMBER() OVER (ORDER BY ${orderBy}) AS rowNumber
+      FROM (
+        SELECT customerRows.*
+        ${customerRows}
+      ) accountRows
+      ${accountActivityApply('customer', 'accountRows')}
     ) pagedRows
-    ${accountActivityApply('customer')}
     WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
     ORDER BY pagedRows.rowNumber ASC
   `;
