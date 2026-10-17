@@ -461,6 +461,61 @@ function accountActivityApply(kind, accountAlias = 'pagedRows') {
   `;
 }
 
+function accountActivityRows(baseRows, kind, paymentFilter) {
+  const customer = kind === 'customer';
+  return `
+    SELECT accountRows.*, tradeActivity.lastTradeDate AS ${customer ? 'lastSaleDate' : 'lastPurchaseDate'},
+      paymentActivity.lastPaymentDate AS ${customer ? 'lastCollectionDate' : 'lastPaymentDate'}
+    FROM (SELECT ${customer ? 'customerRows' : 'supplierRows'}.* ${baseRows}) accountRows
+    ${accountActivityApply(kind, 'accountRows')}
+    WHERE ${paymentFilter === 'none' ? 'paymentActivity.lastPaymentDate IS NULL' : '1 = 1'}
+  `;
+}
+
+function directoryIds(value) {
+  if (!value) return '';
+  const parts = String(value).split(',');
+  if (parts.length > 2000 || parts.some(id => !/^[1-9][0-9]{0,9}$/.test(id) || Number(id) > 2147483647)) throw new Error('Invalid account identifiers');
+  return [...new Set(parts)].join(',');
+}
+
+function directoryScope(alias, state, ids) {
+  const closed = ids ? `${alias}.id IN (${ids})` : '1 = 0';
+  const active = `NOT (${closed})`;
+  return { closed, active, selected: state === 'closed' ? closed : state === 'active' ? active : '1 = 1' };
+}
+
+function directoryTotals(base, alias, scope) {
+  const balance = `${alias}.currentBalance`;
+  return `SELECT
+    COUNT(CASE WHEN ${scope.selected} THEN 1 END) AS totalCount,
+    ISNULL(SUM(CASE WHEN ${scope.selected} THEN ${balance} ELSE 0 END), 0) AS totalBalance,
+    COUNT(CASE WHEN ${scope.selected} AND ${balance} > 0 THEN 1 END) AS positiveCount,
+    ISNULL(SUM(CASE WHEN ${scope.selected} AND ${balance} > 0 THEN ${balance} ELSE 0 END), 0) AS positiveBalance,
+    COUNT(CASE WHEN ${scope.selected} AND ${balance} < 0 THEN 1 END) AS negativeCount,
+    ISNULL(SUM(CASE WHEN ${scope.selected} AND ${balance} < 0 THEN ${balance} ELSE 0 END), 0) AS negativeBalance,
+    COUNT(CASE WHEN ${scope.selected} AND ${balance} = 0 THEN 1 END) AS zeroCount,
+    COUNT(CASE WHEN ${scope.active} THEN 1 END) AS activeCount,
+    ISNULL(SUM(CASE WHEN ${scope.active} THEN ${balance} ELSE 0 END), 0) AS activeBalance,
+    COUNT(CASE WHEN ${scope.closed} THEN 1 END) AS closedCount,
+    ISNULL(SUM(CASE WHEN ${scope.closed} THEN ${balance} ELSE 0 END), 0) AS closedBalance
+    ${base}`;
+}
+
+function accountOrderBy(options, kind) {
+  const paymentField = kind === 'customer' ? 'lastCollectionDate' : 'lastPaymentDate';
+  const paymentDirection = options.paymentDirection === 'asc' ? 'ASC' : 'DESC';
+  const balanceDirection = options.balanceDirection === 'asc' ? 'ASC' : 'DESC';
+  const primary = options.primarySort === 'payment' ? 'payment' : 'balance';
+  const secondary = options.secondarySort === 'balance' || options.secondarySort === 'payment' ? options.secondarySort : null;
+  const order = {
+    balance: `datedRows.currentBalance ${balanceDirection}`,
+    payment: `datedRows.${paymentField} ${paymentDirection}`,
+  };
+  return `CASE WHEN datedRows.${paymentField} IS NULL THEN 1 ELSE 0 END ASC,
+    ${order[primary]}, ${secondary && secondary !== primary ? `${order[secondary]},` : ''} datedRows.id ASC`;
+}
+
 function customerBalanceFilter(balanceFilter) {
   const normalized = String(balanceFilter || 'nonzero').toLowerCase();
   if (normalized === 'all') return { filter: 'all', sql: '1 = 1' };
@@ -481,17 +536,15 @@ function parseAccountPage({ page, pageSize } = {}) {
   };
 }
 
-export async function getCustomers({ search, balanceFilter, sort, page, pageSize } = {}) {
+export async function getCustomers({ search, balanceFilter, sort, page, pageSize, primarySort, secondarySort, balanceDirection, paymentDirection, paymentFilter, accountState, closedIds, phoneMatchIds } = {}) {
   const term = searchText(search);
   const filter = customerBalanceFilter(balanceFilter);
   const paging = parseAccountPage({ page, pageSize });
-  const collectionOrder = sort === 'last-collection-newest' ? 'DESC' : sort === 'last-collection-oldest' ? 'ASC' : null;
-  const orderBy = collectionOrder
-    ? `CASE WHEN paymentActivity.lastPaymentDate IS NULL THEN 1 ELSE 0 END ASC,
-       paymentActivity.lastPaymentDate ${collectionOrder}, accountRows.name ASC, accountRows.id ASC`
-    : `CASE WHEN accountRows.currentBalance > 0 THEN 0 WHEN accountRows.currentBalance < 0 THEN 1 ELSE 2 END ASC,
-       CASE WHEN accountRows.currentBalance > 0 THEN accountRows.currentBalance ELSE NULL END DESC,
-       ABS(accountRows.currentBalance) DESC, accountRows.name ASC, accountRows.id ASC`;
+  const scope = directoryScope('customerRows', accountState, directoryIds(closedIds));
+  const phoneIds = directoryIds(phoneMatchIds);
+  const options = { primarySort: primarySort || (sort?.startsWith('last-collection-') ? 'payment' : 'balance'), secondarySort, balanceDirection,
+    paymentDirection: paymentDirection || (sort === 'last-collection-oldest' ? 'asc' : 'desc') };
+  const orderBy = accountOrderBy(options, 'customer');
   const customerRows = `
     FROM (
       SELECT
@@ -509,40 +562,26 @@ export async function getCustomers({ search, balanceFilter, sort, page, pageSize
           OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
           OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
           OR CONVERT(NVARCHAR(50), p.Person_No) LIKE @searchLike
+          ${phoneIds ? `OR p.Person_No IN (${phoneIds})` : ''}
         )
     ) customerRows
     WHERE ${filter.sql}
   `;
 
+  const activityRows = accountActivityRows(`${customerRows} AND (${scope.selected})`, 'customer', paymentFilter);
   const rowsQuery = `
     SELECT pagedRows.*
     FROM (
       SELECT
-        accountRows.*,
-        tradeActivity.lastTradeDate AS lastSaleDate,
-        paymentActivity.lastPaymentDate AS lastCollectionDate,
+        datedRows.*,
         ROW_NUMBER() OVER (ORDER BY ${orderBy}) AS rowNumber
-      FROM (
-        SELECT customerRows.*
-        ${customerRows}
-      ) accountRows
-      ${accountActivityApply('customer', 'accountRows')}
+      FROM (${activityRows}) datedRows
     ) pagedRows
     WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
     ORDER BY pagedRows.rowNumber ASC
   `;
 
-  const totalsQuery = `
-    SELECT
-      COUNT(1) AS totalCount,
-      ISNULL(SUM(customerRows.currentBalance), 0) AS totalBalance,
-      SUM(CASE WHEN customerRows.currentBalance > 0 THEN 1 ELSE 0 END) AS positiveCount,
-      ISNULL(SUM(CASE WHEN customerRows.currentBalance > 0 THEN customerRows.currentBalance ELSE 0 END), 0) AS positiveBalance,
-      SUM(CASE WHEN customerRows.currentBalance < 0 THEN 1 ELSE 0 END) AS negativeCount,
-      ISNULL(SUM(CASE WHEN customerRows.currentBalance < 0 THEN customerRows.currentBalance ELSE 0 END), 0) AS negativeBalance,
-      SUM(CASE WHEN customerRows.currentBalance = 0 THEN 1 ELSE 0 END) AS zeroCount
-    ${customerRows}
-  `;
+  const totalsQuery = directoryTotals(paymentFilter === 'none' ? `FROM (${accountActivityRows(customerRows, 'customer', paymentFilter)}) customerRows` : customerRows, 'customerRows', scope);
 
   const bindPagedCustomers = (request) => {
     bindSearch(request, term);
@@ -568,7 +607,9 @@ export async function getCustomers({ search, balanceFilter, sort, page, pageSize
     positiveBalance: Number(totals.positiveBalance || 0),
     negativeCount: Number(totals.negativeCount || 0),
     negativeBalance: Number(totals.negativeBalance || 0),
-    zeroCount: Number(totals.zeroCount || 0)
+    zeroCount: Number(totals.zeroCount || 0),
+    activeCount: Number(totals.activeCount || 0), activeBalance: Number(totals.activeBalance || 0),
+    closedCount: Number(totals.closedCount || 0), closedBalance: Number(totals.closedBalance || 0)
   };
 }
 
@@ -580,10 +621,12 @@ function supplierBalanceFilter(balanceFilter) {
   return { filter: 'nonzero', sql: 'supplierRows.currentBalance <> 0' };
 }
 
-export async function getSuppliers({ search, balanceFilter, page, pageSize } = {}) {
+export async function getSuppliers({ search, balanceFilter, page, pageSize, primarySort, secondarySort, balanceDirection, paymentDirection, paymentFilter, accountState, closedIds, phoneMatchIds } = {}) {
   const term = searchText(search);
   const filter = supplierBalanceFilter(balanceFilter);
   const paging = parseAccountPage({ page, pageSize });
+  const scope = directoryScope('supplierRows', accountState, directoryIds(closedIds));
+  const phoneIds = directoryIds(phoneMatchIds);
   const supplierRows = `
     FROM (
       SELECT
@@ -607,41 +650,27 @@ export async function getSuppliers({ search, balanceFilter, page, pageSize } = {
         OR CONVERT(NVARCHAR(4000), p.Person_Name) LIKE @searchLike
         OR CONVERT(NVARCHAR(4000), p.Person_tel) LIKE @searchLike
         OR CONVERT(NVARCHAR(50), p.Person_No) LIKE @searchLike
+        ${phoneIds ? `OR p.Person_No IN (${phoneIds})` : ''}
       )
     ) supplierRows
     WHERE ${filter.sql}
   `;
 
+  const activityRows = accountActivityRows(`${supplierRows} AND (${scope.selected})`, 'supplier', paymentFilter);
+  const orderBy = accountOrderBy({ primarySort, secondarySort, balanceDirection: balanceDirection || 'asc', paymentDirection }, 'supplier');
   const rowsQuery = `
-    SELECT pagedRows.*, tradeActivity.lastTradeDate AS lastPurchaseDate, paymentActivity.lastPaymentDate
+    SELECT pagedRows.*
     FROM (
       SELECT
-        supplierRows.*,
-        ROW_NUMBER() OVER (
-          ORDER BY
-            CASE WHEN supplierRows.currentBalance < 0 THEN 0 WHEN supplierRows.currentBalance > 0 THEN 1 ELSE 2 END ASC,
-            CASE WHEN supplierRows.currentBalance < 0 THEN ABS(supplierRows.currentBalance) ELSE NULL END DESC,
-            ABS(supplierRows.currentBalance) DESC,
-            supplierRows.name ASC
-        ) AS rowNumber
-      ${supplierRows}
+        datedRows.*,
+        ROW_NUMBER() OVER (ORDER BY ${orderBy}) AS rowNumber
+      FROM (${activityRows}) datedRows
     ) pagedRows
-    ${accountActivityApply('supplier')}
     WHERE pagedRows.rowNumber BETWEEN @rowStart AND @rowEnd
     ORDER BY pagedRows.rowNumber ASC
   `;
 
-  const totalsQuery = `
-    SELECT
-      COUNT(1) AS totalCount,
-      ISNULL(SUM(supplierRows.currentBalance), 0) AS totalBalance,
-      SUM(CASE WHEN supplierRows.currentBalance < 0 THEN 1 ELSE 0 END) AS negativeCount,
-      ISNULL(SUM(CASE WHEN supplierRows.currentBalance < 0 THEN supplierRows.currentBalance ELSE 0 END), 0) AS negativeBalance,
-      SUM(CASE WHEN supplierRows.currentBalance > 0 THEN 1 ELSE 0 END) AS positiveCount,
-      ISNULL(SUM(CASE WHEN supplierRows.currentBalance > 0 THEN supplierRows.currentBalance ELSE 0 END), 0) AS positiveBalance,
-      SUM(CASE WHEN supplierRows.currentBalance = 0 THEN 1 ELSE 0 END) AS zeroCount
-    ${supplierRows}
-  `;
+  const totalsQuery = directoryTotals(paymentFilter === 'none' ? `FROM (${accountActivityRows(supplierRows, 'supplier', paymentFilter)}) supplierRows` : supplierRows, 'supplierRows', scope);
 
   const bindPagedSuppliers = (request) => {
     bindSearch(request, term);
@@ -667,7 +696,9 @@ export async function getSuppliers({ search, balanceFilter, page, pageSize } = {
     positiveBalance: Number(totals.positiveBalance || 0),
     negativeCount: Number(totals.negativeCount || 0),
     negativeBalance: Number(totals.negativeBalance || 0),
-    zeroCount: Number(totals.zeroCount || 0)
+    zeroCount: Number(totals.zeroCount || 0),
+    activeCount: Number(totals.activeCount || 0), activeBalance: Number(totals.activeBalance || 0),
+    closedCount: Number(totals.closedCount || 0), closedBalance: Number(totals.closedBalance || 0)
   };
 }
 

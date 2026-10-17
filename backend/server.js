@@ -396,6 +396,14 @@ app.get(
       search: req.query.search,
       balanceFilter: req.query.balanceFilter,
       sort: req.query.sort,
+      primarySort: req.query.primarySort,
+      secondarySort: req.query.secondarySort,
+      balanceDirection: req.query.balanceDirection,
+      paymentDirection: req.query.paymentDirection,
+      paymentFilter: req.query.paymentFilter,
+      accountState: req.query.accountState,
+      closedIds: req.query.closedIds,
+      phoneMatchIds: req.query.phoneMatchIds,
       page: req.query.page,
       pageSize: req.query.pageSize
     });
@@ -407,6 +415,14 @@ app.get(
   '/api/suppliers',
   asyncRoute(async (req, res) => {
     const result = await almohasebProfile.getSuppliers({
+      primarySort: req.query.primarySort,
+      secondarySort: req.query.secondarySort,
+      balanceDirection: req.query.balanceDirection,
+      paymentDirection: req.query.paymentDirection,
+      paymentFilter: req.query.paymentFilter,
+      accountState: req.query.accountState,
+      closedIds: req.query.closedIds,
+      phoneMatchIds: req.query.phoneMatchIds,
       search: req.query.search,
       balanceFilter: req.query.balanceFilter,
       page: req.query.page,
