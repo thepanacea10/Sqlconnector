@@ -1131,6 +1131,16 @@ export async function getCustomerStatement(id, options = {}) {
 }
 
 async function getInvoiceDetails(movementNo, { type }) {
+  const priceUnitFactor = `CASE
+    WHEN ISNULL(COALESCE(barcodeUnit.Unit_OldQuantity, defaultUnit.Unit_OldQuantity), 0) = 0 THEN 1
+    ELSE COALESCE(barcodeUnit.Unit_OldQuantity, defaultUnit.Unit_OldQuantity)
+  END`;
+  // Purchase quantities and prices must describe the same package, without changing line totals.
+  const purchaseDisplayFactor = `CASE
+    WHEN ISNULL(defaultUnit.Unit_OldQuantity, 0) > 0 THEN defaultUnit.Unit_OldQuantity
+    WHEN ISNULL(barcodeUnit.Unit_OldQuantity, 0) > 0 THEN barcodeUnit.Unit_OldQuantity
+    ELSE 1
+  END`;
   const accountFilter = type === 'purchase'
     ? `mr.Account_No IN (${purchaseAccountNumbers})`
     : 'mr.Account_No IN (1, 2, 3, 4)';
@@ -1180,13 +1190,14 @@ async function getInvoiceDetails(movementNo, { type }) {
       d.Item_No AS itemNo,
       ISNULL(item.Scientific_Name, N'غير محدد') AS itemName,
       COALESCE(NULLIF(CONVERT(NVARCHAR(200), d.Barcode), N''), barcodeInfo.Barcode, N'') AS barcode,
-      ISNULL(COALESCE(barcodeUnit.Unit_Type, defaultUnit.Unit_Type), N'') AS unitName,
-      ISNULL(d.Item_Quntity, 0) AS quantity,
-      ISNULL(d.Charge_Value, 0)
-        / CASE
-          WHEN ISNULL(COALESCE(barcodeUnit.Unit_OldQuantity, defaultUnit.Unit_OldQuantity), 0) = 0 THEN 1
-          ELSE COALESCE(barcodeUnit.Unit_OldQuantity, defaultUnit.Unit_OldQuantity)
-        END AS price,
+      ${type === 'purchase'
+        ? `ISNULL(CASE WHEN ISNULL(defaultUnit.Unit_OldQuantity, 0) > 0 THEN defaultUnit.Unit_Type ELSE COALESCE(barcodeUnit.Unit_Type, defaultUnit.Unit_Type) END, N'')`
+        : `ISNULL(COALESCE(barcodeUnit.Unit_Type, defaultUnit.Unit_Type), N'')`} AS unitName,
+      ${type === 'purchase'
+        ? `ISNULL(d.Item_Quntity, 0) / (1.0 * (${purchaseDisplayFactor}))`
+        : 'ISNULL(d.Item_Quntity, 0)'} AS quantity,
+      ISNULL(d.Charge_Value, 0) / (${priceUnitFactor})
+        ${type === 'purchase' ? `* (${purchaseDisplayFactor})` : ''} AS price,
       ISNULL(d.Charge_Value, 0)
         / CASE
           WHEN ISNULL(COALESCE(barcodeUnit.Unit_OldQuantity, defaultUnit.Unit_OldQuantity), 0) = 0 THEN 1
